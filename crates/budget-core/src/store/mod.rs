@@ -11,6 +11,7 @@
 
 pub mod schema;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -108,6 +109,9 @@ pub struct PayeeRow {
     pub name: String,
     pub category_id: String,
     pub created_at: String,
+    /// Distinct `merchant_raw` strings from ekstras bound to this payee,
+    /// with how many txns used that exact extra text.
+    pub sources: Vec<(String, i64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -682,9 +686,34 @@ impl TursoStore {
                 name: text(&row, 1)?,
                 category_id: text(&row, 2)?,
                 created_at: text(&row, 3)?,
+                sources: Vec::new(),
             });
         }
         drop(rows);
+
+        let mut src_rows = conn
+            .query(
+                "SELECT payee_id, merchant_raw, COUNT(*) \
+                 FROM txn WHERE payee_id IS NOT NULL \
+                 GROUP BY payee_id, merchant_raw \
+                 ORDER BY COUNT(*) DESC, merchant_raw",
+                (),
+            )
+            .await
+            .map_err(backend)?;
+        let mut by_payee: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+        while let Some(row) = src_rows.next().await.map_err(backend)? {
+            let id = text(&row, 0)?;
+            let raw = text(&row, 1)?;
+            let n = int_of(&row, 2)?;
+            by_payee.entry(id).or_default().push((raw, n));
+        }
+        drop(src_rows);
+        for p in &mut out {
+            if let Some(src) = by_payee.remove(&p.id) {
+                p.sources = src;
+            }
+        }
         Ok(out)
     }
 

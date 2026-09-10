@@ -259,6 +259,19 @@ form.inline {
   min-width: 180px;
 }
 
+.payee-sources {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.payee-sources li {
+  margin-top: 2px;
+  word-break: break-word;
+}
+
 form.inline[data-autosubmit] {
   margin-top: 0;
 }

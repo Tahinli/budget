@@ -725,6 +725,19 @@ async fn payees(cx: &Cx) -> Result<Response> {
                                     action=(format!("/payees/{}", p.id)) data-autosubmit=""></form>
                                 <input class="payee-name" type="text" name="name"
                                     form=(format!("p-{}", p.id)) value=(p.name.clone()) required="">
+                                if !p.sources.is_empty() {
+                                    <div class="field-label">(t(lang, Key::OnStatement))</div>
+                                    <ul class="payee-sources">
+                                        for (raw, n) in p.sources.clone() {
+                                            <li>
+                                                (raw.clone())
+                                                if n > 1 {
+                                                    <span>(format!(" · {n}"))</span>
+                                                }
+                                            </li>
+                                        }
+                                    </ul>
+                                }
                             </td>
                             <td>
                                 <select name="category" form=(format!("p-{}", p.id))>
