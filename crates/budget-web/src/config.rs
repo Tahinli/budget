@@ -1,7 +1,7 @@
 //! `config/budget.toml` — CWD'den okunur; dosya yoksa geliştirme
-//! varsayılanları o yola yazılır ve açılış sürer (doldurulacak OIDC yok).
-//! HOST/PORT ortam değişkenleri asla okunmaz: dinleme adresi yalnızca bu
-//! dosyanın kararıdır.
+//! varsayılanları o yola yazılır. `client_id` boşsa sunucu açılışta im'de
+//! istemci açmayı söyleyip durur. HOST/PORT ortam değişkenleri asla
+//! okunmaz: dinleme adresi yalnızca bu dosyanın kararıdır.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +17,15 @@ pub const DEFAULTS: &str = "\
 database = \"budget.db\"
 storage = \"storage\"
 listen = \"127.0.0.1:7656\"
+
+[oidc]
+# im'in adresi ve bu uygulamanın im'deki kaydı. client_id boşken sunucu
+# açılmaz: `im-web create-client budget <redirect_uri>` çıktısını buraya
+# yazın. Gerçek sırlar depoya yazılmaz; dosya gitignored.
+issuer = \"http://127.0.0.1:7650\"
+client_id = \"\"
+client_secret = \"\"
+redirect_uri = \"http://127.0.0.1:7656/auth/callback\"
 ";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,6 +36,43 @@ pub struct Config {
     pub storage: PathBuf,
     #[serde(default = "default_listen")]
     pub listen: String,
+    #[serde(default)]
+    pub oidc: OidcConfig,
+}
+
+/// im OIDC kaydı. Eski bir `config/budget.toml`da `[oidc]` tablosu yoksa
+/// hepsi varsayılanına düşer: boş `client_id` sunucuyu ipucuyla durdurur.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OidcConfig {
+    #[serde(default = "default_issuer")]
+    pub issuer: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default = "default_redirect_uri")]
+    pub redirect_uri: String,
+}
+
+fn default_issuer() -> String {
+    "http://127.0.0.1:7650".to_string()
+}
+
+fn default_redirect_uri() -> String {
+    "http://127.0.0.1:7656/auth/callback".to_string()
+}
+
+impl Default for OidcConfig {
+    /// Tablo tümüyle yoksa: adresler geliştirme varsayılanı, sırlar boş —
+    /// `[oidc]` satırlarıyla yazılan dosyanın geri kalanıyla aynı.
+    fn default() -> Self {
+        Self {
+            issuer: default_issuer(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: default_redirect_uri(),
+        }
+    }
 }
 
 fn default_database() -> PathBuf {
@@ -65,6 +111,11 @@ impl Config {
             format!("database {}", self.database.display()),
             format!("storage  {}", self.storage.display()),
             format!("listen   {}", self.listen),
+            format!(
+                "oidc     {} · client_id {}",
+                self.oidc.issuer,
+                if self.oidc.client_id.is_empty() { "boş" } else { "ayarlı" }
+            ),
         ]
     }
 }

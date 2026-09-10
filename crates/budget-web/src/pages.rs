@@ -26,6 +26,16 @@ path_param!(code);
 
 const IMPORT_LIMIT: usize = 8 * 1024 * 1024;
 
+/// Kişiyi ister; oturum yoksa işleyici giriş yönlendirmesiyle döner.
+macro_rules! user_or {
+    ($cx:expr) => {
+        match server::require_user($cx).await {
+            Ok(user) => user,
+            Err(redirect) => return Ok(redirect),
+        }
+    };
+}
+
 async fn respond(
     cx: &Cx,
     nav: Nav,
@@ -130,8 +140,25 @@ async fn set_lang(cx: &Cx) -> Result<Response> {
 #[route(GET "/")]
 async fn home(cx: &Cx) -> Result<Response> {
     let lang = lang_of(cx);
+    // Ön kapı: giren tarayıcı panoyu görür, girmeyen tek giriş kartını.
+    // Yönlendirme yok: dağıtım `/`'den stil sayfası ister, sayfa da
+    // kabuğunu ve stilini her durumda basar.
+    let user = match server::require_user(cx).await {
+        Ok(user) => user,
+        Err(_) => {
+            let stage = view! {
+                cx =>
+                <h1 class="page-title">(t(lang, Key::TitleHome))</h1>
+                <section class="card empty">
+                    <p>(t(lang, Key::SignInBlurb))</p>
+                    <p><a class="button" href="/auth/login">(t(lang, Key::SignIn))</a></p>
+                </section>
+            };
+            return respond(cx, Nav::Home, t(lang, Key::TitleHome), stage).await;
+        }
+    };
     let store = server::store(cx);
-    let statements = store.statements().await?;
+    let statements = store.statements(&user.sub).await?;
     if statements.is_empty() {
         let stage = view! {
             cx =>
@@ -149,7 +176,7 @@ async fn home(cx: &Cx) -> Result<Response> {
         Some(id) if statements.iter().any(|s| s.id == id) => Some(id),
         _ => statements.first().map(|s| s.id.clone()),
     };
-    let dash = store.dashboard(picked.as_deref()).await?;
+    let dash = store.dashboard(&user.sub, picked.as_deref()).await?;
     let st = dash.statement.as_ref().expect("seçili dönem ekstresi vardır");
 
     let mut cat_bars: Vec<Bar> = dash
@@ -391,12 +418,14 @@ async fn import_page(
 
 #[route(GET "/import")]
 async fn import_get(cx: &Cx) -> Result<Response> {
+    user_or!(cx);
     let ok = query_value(&current_query(cx), "ok");
     import_page(cx, ok.as_deref(), None).await
 }
 
 #[route(POST "/import")]
 async fn import_post(cx: &Cx, mut multipart: Multipart) -> Result<Response> {
+    let user = user_or!(cx);
     let mut file: Option<Vec<u8>> = None;
     loop {
         let mut field = match multipart.next_field().await {
@@ -454,9 +483,8 @@ async fn import_post(cx: &Cx, mut multipart: Multipart) -> Result<Response> {
             return import_page(cx, None, Some(ImportProblem::Parse(other.to_string()))).await;
         }
     };
-
     let store = server::store(cx);
-    match store.import(parsed).await {
+    match store.import(&user.sub, parsed).await {
         Ok(report) if report.duplicate => see_other("/import?ok=dupe").into_response(cx),
         Ok(_) => see_other("/import?ok=new").into_response(cx),
         Err(_) => see_other("/import?error=depo").into_response(cx),
@@ -465,9 +493,10 @@ async fn import_post(cx: &Cx, mut multipart: Multipart) -> Result<Response> {
 
 #[route(GET "/inbox")]
 async fn inbox(cx: &Cx) -> Result<Response> {
+    let user = user_or!(cx);
     let lang = lang_of(cx);
     let store = server::store(cx);
-    let groups = store.unlabeled_groups().await?;
+    let groups = store.unlabeled_groups(&user.sub).await?;
     let categories = store.categories().await?;
     let error = query_value(&current_query(cx), "error");
     let error_banner = error.map(|code| {
@@ -546,13 +575,14 @@ struct LabelForm {
 
 #[route(POST "/inbox/label")]
 async fn inbox_label(cx: &Cx, Form(input): Form<LabelForm>) -> Result<Response> {
+    let user = user_or!(cx);
     let store = server::store(cx);
     let name = input.payee.trim();
     let back = if name.is_empty() {
         "/inbox?error=isim"
     } else {
         match store
-            .label(&input.merchant_norm, name, &input.category)
+            .label(&user.sub, &input.merchant_norm, name, &input.category)
             .await
         {
             Ok(_) => "/inbox",
@@ -585,9 +615,10 @@ fn amount_class(direction: Direction) -> Option<&'static str> {
 
 #[route(GET "/txns")]
 async fn txns(cx: &Cx) -> Result<Response> {
+    let user = user_or!(cx);
     let lang = lang_of(cx);
     let store = server::store(cx);
-    let statements = store.statements().await?;
+    let statements = store.statements(&user.sub).await?;
     let categories = store.categories().await?;
 
     let query = current_query(cx);
@@ -597,14 +628,16 @@ async fn txns(cx: &Cx) -> Result<Response> {
     let f_q = query_value(&query, "q")
         .map(|q| q.trim().to_string())
         .filter(|q| !q.is_empty());
-
     let rows = store
-        .list_txns(TxnFilter {
-            statement_id: f_statement.clone(),
-            category_id: f_category.clone(),
-            unlabeled_only: f_unlabeled,
-            q: f_q.clone(),
-        })
+        .list_txns(
+            &user.sub,
+            TxnFilter {
+                statement_id: f_statement.clone(),
+                category_id: f_category.clone(),
+                unlabeled_only: f_unlabeled,
+                q: f_q.clone(),
+            },
+        )
         .await?;
 
     let stmt_opts: Vec<(String, String, bool)> = statements
@@ -703,9 +736,10 @@ async fn txns(cx: &Cx) -> Result<Response> {
 
 #[route(GET "/payees")]
 async fn payees(cx: &Cx) -> Result<Response> {
+    let user = user_or!(cx);
     let lang = lang_of(cx);
     let store = server::store(cx);
-    let payees = store.payees().await?;
+    let payees = store.payees(&user.sub).await?;
     let categories = store.categories().await?;
     let error = query_value(&current_query(cx), "error");
     let cat_opts: Vec<(String, String)> = categories
@@ -792,10 +826,11 @@ struct PayeeForm {
 
 #[route(POST "/payees/{payee_id}")]
 async fn payee_update(cx: &Cx, Form(input): Form<PayeeForm>) -> Result<Response> {
+    let user = user_or!(cx);
     let store = server::store(cx);
     let id: &str = path_param::<PayeeId>(cx);
     let back = match store
-        .update_payee(id, Some(&input.name), Some(&input.category))
+        .update_payee(&user.sub, id, Some(&input.name), Some(&input.category))
         .await
     {
         Ok(()) => "/payees",
@@ -811,9 +846,10 @@ struct SourceForm {
 
 #[route(POST "/payees/{payee_id}/clear")]
 async fn payee_clear(cx: &Cx) -> Result<Response> {
+    let user = user_or!(cx);
     let store = server::store(cx);
     let id: &str = path_param::<PayeeId>(cx);
-    let back = match store.clear_payee(id).await {
+    let back = match store.clear_payee(&user.sub, id).await {
         Ok(()) => "/payees",
         Err(_) => "/payees?error=depo",
     };
@@ -822,9 +858,10 @@ async fn payee_clear(cx: &Cx) -> Result<Response> {
 
 #[route(POST "/payees/{payee_id}/source")]
 async fn payee_clear_source(cx: &Cx, Form(input): Form<SourceForm>) -> Result<Response> {
+    let user = user_or!(cx);
     let store = server::store(cx);
     let id: &str = path_param::<PayeeId>(cx);
-    let back = match store.clear_source(id, &input.merchant_norm).await {
+    let back = match store.clear_source(&user.sub, id, &input.merchant_norm).await {
         Ok(()) => "/payees",
         Err(_) => "/payees?error=depo",
     };

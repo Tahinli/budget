@@ -1,8 +1,8 @@
 //! Per-phrase UI strings. Same shape as im-web: one [`Key`] per sentence,
 //! exhaustive [`t`] so a missing translation fails to compile.
-//!
-//! Language lives in the `budget_lang` cookie (no accounts). Anything other
-//! than `"en"` is Turkish — the data and the first ship were TR.
+//! Language lives in the `budget_lang` cookie; the person comes from the
+//! im session. Anything other than `"en"` is Turkish — the data and the
+//! first ship were TR.
 
 use topcoat::context::Cx;
 use topcoat::cookie::{Cookies, cookies};
@@ -129,6 +129,9 @@ pub enum Key {
     NoFileChosen,
     UnlabeledBar,
     MonthSpendPay,
+    SignIn,
+    SignInBlurb,
+    SignOut,
 }
 
 pub fn t(lang: Lang, key: Key) -> &'static str {
@@ -311,6 +314,12 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
         (UnlabeledBar, Tr) => "Etiketsiz",
         (MonthSpendPay, En) => "{} · spend {} · payments {}",
         (MonthSpendPay, Tr) => "{} · harcama {} · ödeme {}",
+        (SignIn, En) => "Sign in",
+        (SignIn, Tr) => "Giriş yap",
+        (SignInBlurb, En) => "Your spending lives under your sign-in. The button opens im's sign-in and brings you back here.",
+        (SignInBlurb, Tr) => "Harcamaların girişine bağlı. Düğme im'in giriş sayfasını açar ve seni buraya döndürür.",
+        (SignOut, En) => "Sign out",
+        (SignOut, Tr) => "Çıkış",
     }
 }
 

@@ -2,12 +2,16 @@
 //!
 //! turso süreç-içi ve SQLite uyumlu olduğundan şema düz SQL'dir; kendisi
 //! geçiş çalıştırıcısı taşımadığından [`TursoStore::open`] boş veritabanına
-//! bildirilen şemayı kurar, dolu olana ise parmak izini sorar: uyuşmayan
-//! veritabanı hiç açılmaz.
+//! bildirilen şemayı kurar, dolu olanı kullanıcı kapsamına yükseltip sonra
+//! parmak izini sorar: uyuşmayan veritabanı hiç açılmaz.
 //!
 //! Eşleştirme bütün ürünün omurgasıdır: `label`, `merchant_norm` için bir
 //! takma ad yazar ve o anahtarla işaretli tüm işlemleri o payee'ye çeker —
 //! sonraki içe aktarımlar takma ada otomatik bağlanır.
+//!
+//! Depo çok kiracılıdır: payee, takma ad, ekstre ve işlem satırları
+//! `user_id` ile kilitlenir (im OIDC `sub`); veri metotları kullanıcıyı
+//! ilk veri argümanı olarak alır. Kategoriler kiracılar arası ortaktır.
 
 pub mod schema;
 
@@ -34,6 +38,15 @@ pub const PAYEE_CARD_PAYMENT: &str = "Kart ödemesi";
 pub const CAT_MARKET: &str = "01CATMARKET000000000000000";
 pub const CAT_IADE: &str = "01CATIADE0000000000000000";
 pub const CAT_ODEME: &str = "01CATODEME000000000000000";
+
+/// Kullanıcı kapsamına yükseltme öncesindeki tek kişilik verinin kiracı
+/// anahtarı; [`TursoStore::claim_local`] bu satırları gerçek kullanıcıya
+/// devreder.
+const LOCAL_USER: &str = "local";
+
+/// Kiracı tabloları — `user_id` sütunu taşıyan tablolar; yükseltme ve
+/// `claim_local` bu sırayla işler.
+const TENANT_TABLES: [&str; 4] = ["payee", "payee_alias", "statement", "txn"];
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -263,21 +276,21 @@ impl TursoStore {
         })
     }
 
-    /// Bir ekstreyi depoya yazar.
+    /// Bir ekstreyi depoya yazar; satırlar `user_id`'ye kilitlenir.
     ///
-    /// 1. Aynı `source_sha256` geçmişte varsa hiçbir şey yazılmaz; mevcut
-    ///    sayılarla `duplicate: true` döner.
+    /// 1. Aynı kullanıcıda aynı `source_sha256` geçmişte varsa hiçbir şey
+    ///    yazılmaz; mevcut sayılarla `duplicate: true` döner.
     /// 2. Yoksa ekstre ve tüm işlemler tek işlemde yazılır.
     /// 3. Her işlem için `payee_alias` eşleşirse `txn.payee_id` set edilir.
     /// 4. "şube-hesaptan ödeme" imzalı tüccarlar tohum takma adıyla otomatik
     ///    olarak "Kart ödemesi" payee'sine bağlanır.
-    pub async fn import(&self, parsed: ParseResult) -> Result<ImportReport> {
+    pub async fn import(&self, user_id: &str, parsed: ParseResult) -> Result<ImportReport> {
         let conn = self.conn.lock().await;
 
         let mut rows = conn
             .query(
-                "SELECT id FROM statement WHERE source_sha256 = ?",
-                params![parsed.statement.source_sha256.as_str()],
+                "SELECT id FROM statement WHERE user_id = ? AND source_sha256 = ?",
+                params![user_id, parsed.statement.source_sha256.as_str()],
             )
             .await
             .map_err(backend)?;
@@ -297,12 +310,12 @@ impl TursoStore {
 
         let statement_id = new_id();
         conn.execute("BEGIN IMMEDIATE", ()).await.map_err(backend)?;
-        if let Err(e) = insert_statement(&conn, &statement_id, &parsed.statement).await {
+        if let Err(e) = insert_statement(&conn, user_id, &statement_id, &parsed.statement).await {
             let _ = conn.execute("ROLLBACK", ()).await;
             return Err(e);
         }
         for txn in &parsed.txns {
-            if let Err(e) = insert_txn(&conn, &statement_id, txn).await {
+            if let Err(e) = insert_txn(&conn, user_id, &statement_id, txn).await {
                 let _ = conn.execute("ROLLBACK", ()).await;
                 return Err(e);
             }
@@ -317,7 +330,7 @@ impl TursoStore {
         payment_norms.sort_unstable();
         payment_norms.dedup();
         for norm in payment_norms {
-            if let Err(e) = link_payment_norm(&conn, norm, &statement_id).await {
+            if let Err(e) = link_payment_norm(&conn, user_id, norm, &statement_id).await {
                 let _ = conn.execute("ROLLBACK", ()).await;
                 return Err(e);
             }
@@ -336,14 +349,14 @@ impl TursoStore {
 
     /// Etiketsiz işlemleri `merchant_norm` başına gruplar; gelen kutusunun
     /// satırlarıdır. Her grup, tarihe göre yeni→eski işlem listesini taşır.
-    pub async fn unlabeled_groups(&self) -> Result<Vec<MerchantGroup>> {
+    pub async fn unlabeled_groups(&self, user_id: &str) -> Result<Vec<MerchantGroup>> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
                 "SELECT merchant_norm, merchant_raw, extra, date, amount_minor, direction \
-                 FROM txn WHERE payee_id IS NULL \
+                 FROM txn WHERE user_id = ? AND payee_id IS NULL \
                  ORDER BY date DESC, row_index DESC",
-                (),
+                params![user_id],
             )
             .await
             .map_err(backend)?;
@@ -396,6 +409,7 @@ impl TursoStore {
     /// çeker. Sonraki içe aktarımlar takma ada kendiliğinden bağlanır.
     pub async fn label(
         &self,
+        user_id: &str,
         merchant_norm: &str,
         payee_name: &str,
         category_id: &str,
@@ -416,8 +430,8 @@ impl TursoStore {
 
         let mut rows = conn
             .query(
-                "SELECT id FROM payee WHERE name = ?",
-                params![payee_name],
+                "SELECT id FROM payee WHERE user_id = ? AND name = ?",
+                params![user_id, payee_name],
             )
             .await
             .map_err(backend)?;
@@ -426,8 +440,9 @@ impl TursoStore {
             None => {
                 let id = new_id();
                 conn.execute(
-                    "INSERT INTO payee (id, name, category_id, created_at) VALUES (?, ?, ?, ?)",
-                    params![id.as_str(), payee_name, category_id, now_text()],
+                    "INSERT INTO payee (id, user_id, name, category_id, created_at) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![id.as_str(), user_id, payee_name, category_id, now_text()],
                 )
                 .await
                 .map_err(backend)?;
@@ -437,16 +452,16 @@ impl TursoStore {
         drop(rows);
 
         conn.execute(
-            "UPDATE payee SET category_id = ? WHERE id = ?",
-            params![category_id, payee_id.as_str()],
+            "UPDATE payee SET category_id = ? WHERE id = ? AND user_id = ?",
+            params![category_id, payee_id.as_str(), user_id],
         )
         .await
         .map_err(backend)?;
 
         let mut rows = conn
             .query(
-                "SELECT payee_id FROM payee_alias WHERE merchant_norm = ?",
-                params![merchant_norm],
+                "SELECT payee_id FROM payee_alias WHERE user_id = ? AND merchant_norm = ?",
+                params![user_id, merchant_norm],
             )
             .await
             .map_err(backend)?;
@@ -454,15 +469,16 @@ impl TursoStore {
         drop(rows);
         if alias_created {
             conn.execute(
-                "INSERT INTO payee_alias (merchant_norm, payee_id, created_at) VALUES (?, ?, ?)",
-                params![merchant_norm, payee_id.as_str(), now_text()],
+                "INSERT INTO payee_alias (user_id, merchant_norm, payee_id, created_at) \
+                 VALUES (?, ?, ?, ?)",
+                params![user_id, merchant_norm, payee_id.as_str(), now_text()],
             )
             .await
             .map_err(backend)?;
         } else {
             conn.execute(
-                "UPDATE payee_alias SET payee_id = ? WHERE merchant_norm = ?",
-                params![payee_id.as_str(), merchant_norm],
+                "UPDATE payee_alias SET payee_id = ? WHERE user_id = ? AND merchant_norm = ?",
+                params![payee_id.as_str(), user_id, merchant_norm],
             )
             .await
             .map_err(backend)?;
@@ -470,8 +486,8 @@ impl TursoStore {
 
         let txns_updated = conn
             .execute(
-                "UPDATE txn SET payee_id = ? WHERE merchant_norm = ?",
-                params![payee_id.as_str(), merchant_norm],
+                "UPDATE txn SET payee_id = ? WHERE user_id = ? AND merchant_norm = ?",
+                params![payee_id.as_str(), user_id, merchant_norm],
             )
             .await
             .map_err(backend)?;
@@ -483,13 +499,19 @@ impl TursoStore {
         })
     }
 
-    pub async fn set_payee_category(&self, payee_id: &str, category_id: &str) -> Result<()> {
-        self.update_payee(payee_id, None, Some(category_id)).await
+    pub async fn set_payee_category(
+        &self,
+        user_id: &str,
+        payee_id: &str,
+        category_id: &str,
+    ) -> Result<()> {
+        self.update_payee(user_id, payee_id, None, Some(category_id)).await
     }
 
     /// Payee adını ve/veya kategorisini yazar. Boş ad reddedilir.
     pub async fn update_payee(
         &self,
+        user_id: &str,
         payee_id: &str,
         name: Option<&str>,
         category_id: Option<&str>,
@@ -502,8 +524,8 @@ impl TursoStore {
             }
             let mut rows = conn
                 .query(
-                    "SELECT id FROM payee WHERE name = ? AND id != ?",
-                    params![name, payee_id],
+                    "SELECT id FROM payee WHERE user_id = ? AND name = ? AND id != ?",
+                    params![user_id, name, payee_id],
                 )
                 .await
                 .map_err(backend)?;
@@ -513,11 +535,11 @@ impl TursoStore {
             };
             drop(rows);
             if let Some(keeper) = other {
-                merge_payee_into(&conn, &keeper, payee_id).await?;
+                merge_payee_into(&conn, user_id, &keeper, payee_id).await?;
                 if let Some(category_id) = category_id {
                     conn.execute(
-                        "UPDATE payee SET category_id = ? WHERE id = ?",
-                        params![category_id, keeper.as_str()],
+                        "UPDATE payee SET category_id = ? WHERE id = ? AND user_id = ?",
+                        params![category_id, keeper.as_str(), user_id],
                     )
                     .await
                     .map_err(backend)?;
@@ -526,8 +548,8 @@ impl TursoStore {
             }
             let changed = conn
                 .execute(
-                    "UPDATE payee SET name = ? WHERE id = ?",
-                    params![name, payee_id],
+                    "UPDATE payee SET name = ? WHERE id = ? AND user_id = ?",
+                    params![name, payee_id, user_id],
                 )
                 .await
                 .map_err(backend)?;
@@ -550,8 +572,8 @@ impl TursoStore {
             }
             let changed = conn
                 .execute(
-                    "UPDATE payee SET category_id = ? WHERE id = ?",
-                    params![category_id, payee_id],
+                    "UPDATE payee SET category_id = ? WHERE id = ? AND user_id = ?",
+                    params![category_id, payee_id, user_id],
                 )
                 .await
                 .map_err(backend)?;
@@ -563,22 +585,25 @@ impl TursoStore {
     }
 
     /// Payee'nin bütün etiketini kaldırır: işlemler gelen kutusuna döner.
-    pub async fn clear_payee(&self, payee_id: &str) -> Result<()> {
+    pub async fn clear_payee(&self, user_id: &str, payee_id: &str) -> Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE txn SET payee_id = NULL WHERE payee_id = ?",
-            params![payee_id],
+            "UPDATE txn SET payee_id = NULL WHERE user_id = ? AND payee_id = ?",
+            params![user_id, payee_id],
         )
         .await
         .map_err(backend)?;
         conn.execute(
-            "DELETE FROM payee_alias WHERE payee_id = ?",
-            params![payee_id],
+            "DELETE FROM payee_alias WHERE user_id = ? AND payee_id = ?",
+            params![user_id, payee_id],
         )
         .await
         .map_err(backend)?;
         let n = conn
-            .execute("DELETE FROM payee WHERE id = ?", params![payee_id])
+            .execute(
+                "DELETE FROM payee WHERE id = ? AND user_id = ?",
+                params![payee_id, user_id],
+            )
             .await
             .map_err(backend)?;
         if n == 0 {
@@ -588,24 +613,29 @@ impl TursoStore {
     }
 
     /// Tek bir POS gövdesini payee'den koparır.
-    pub async fn clear_source(&self, payee_id: &str, merchant_norm: &str) -> Result<()> {
+    pub async fn clear_source(
+        &self,
+        user_id: &str,
+        payee_id: &str,
+        merchant_norm: &str,
+    ) -> Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE txn SET payee_id = NULL WHERE payee_id = ? AND merchant_norm = ?",
-            params![payee_id, merchant_norm],
+            "UPDATE txn SET payee_id = NULL WHERE user_id = ? AND payee_id = ? AND merchant_norm = ?",
+            params![user_id, payee_id, merchant_norm],
         )
         .await
         .map_err(backend)?;
         conn.execute(
-            "DELETE FROM payee_alias WHERE payee_id = ? AND merchant_norm = ?",
-            params![payee_id, merchant_norm],
+            "DELETE FROM payee_alias WHERE user_id = ? AND payee_id = ? AND merchant_norm = ?",
+            params![user_id, payee_id, merchant_norm],
         )
         .await
         .map_err(backend)?;
         let mut rows = conn
             .query(
-                "SELECT COUNT(*) FROM txn WHERE payee_id = ?",
-                params![payee_id],
+                "SELECT COUNT(*) FROM txn WHERE user_id = ? AND payee_id = ?",
+                params![user_id, payee_id],
             )
             .await
             .map_err(backend)?;
@@ -616,12 +646,15 @@ impl TursoStore {
         drop(rows);
         if left == 0 {
             conn.execute(
-                "DELETE FROM payee_alias WHERE payee_id = ?",
-                params![payee_id],
+                "DELETE FROM payee_alias WHERE user_id = ? AND payee_id = ?",
+                params![user_id, payee_id],
             )
             .await
             .map_err(backend)?;
-            conn.execute("DELETE FROM payee WHERE id = ?", params![payee_id])
+            conn.execute(
+                "DELETE FROM payee WHERE id = ? AND user_id = ?",
+                params![payee_id, user_id],
+            )
                 .await
                 .map_err(backend)?;
         }
@@ -631,13 +664,13 @@ impl TursoStore {
 
     /// Gösterge panosu. `statement_id` verilmezse bütün geçmiş ölçülür;
     /// verilen ekstre yoksa `NotFound`.
-    pub async fn dashboard(&self, statement_id: Option<&str>) -> Result<Dashboard> {
+    pub async fn dashboard(&self, user_id: &str, statement_id: Option<&str>) -> Result<Dashboard> {
         let conn = self.conn.lock().await;
         let statement = match statement_id {
-            Some(id) => Some(statement_by_id(&conn, id).await?),
-            None => latest_statement(&conn).await?,
+            Some(id) => Some(statement_by_id(&conn, user_id, id).await?),
+            None => latest_statement(&conn, user_id).await?,
         };
-        let (scope_sql, scope_vals) = scope_clause(statement_id);
+        let (scope_sql, scope_vals) = scope_clause(user_id, statement_id);
 
         let sql = format!(
             "SELECT c.id, c.name, c.kind, c.color, c.sort, SUM(t.amount_minor) \
@@ -721,11 +754,13 @@ impl TursoStore {
     }
 
     /// İşlem tablosu; filtreler AND'lenir, en yeni tarih başta.
-    pub async fn list_txns(&self, f: TxnFilter) -> Result<Vec<TxnRow>> {
+    pub async fn list_txns(&self, user_id: &str, f: TxnFilter) -> Result<Vec<TxnRow>> {
         let conn = self.conn.lock().await;
 
         let mut where_sql = String::new();
         let mut vals: Vec<Value> = Vec::new();
+        where_sql.push_str(" AND t.user_id = ?");
+        vals.push(text_val(user_id));
         if let Some(id) = &f.statement_id {
             where_sql.push_str(" AND t.statement_id = ?");
             vals.push(text_val(id));
@@ -804,12 +839,13 @@ impl TursoStore {
         Ok(out)
     }
 
-    pub async fn payees(&self) -> Result<Vec<PayeeRow>> {
+    pub async fn payees(&self, user_id: &str) -> Result<Vec<PayeeRow>> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, name, category_id, created_at FROM payee ORDER BY name",
-                (),
+                "SELECT id, name, category_id, created_at FROM payee \
+                 WHERE user_id = ? ORDER BY name",
+                params![user_id],
             )
             .await
             .map_err(backend)?;
@@ -828,10 +864,10 @@ impl TursoStore {
         let mut src_rows = conn
             .query(
                 "SELECT payee_id, merchant_norm, COUNT(*), MIN(merchant_raw) \
-                 FROM txn WHERE payee_id IS NOT NULL \
+                 FROM txn WHERE user_id = ? AND payee_id IS NOT NULL \
                  GROUP BY payee_id, merchant_norm \
                  ORDER BY COUNT(*) DESC, merchant_norm",
-                (),
+                params![user_id],
             )
             .await
             .map_err(backend)?;
@@ -856,7 +892,7 @@ impl TursoStore {
         Ok(out)
     }
 
-    pub async fn statements(&self) -> Result<Vec<StatementRow>> {
+    pub async fn statements(&self, user_id: &str) -> Result<Vec<StatementRow>> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
@@ -864,8 +900,8 @@ impl TursoStore {
                         next_due_date, previous_balance_minor, spend_minor, fees_minor, \
                         payments_minor, period_debt_minor, period_debt_usd_minor, \
                         min_pay_minor, card_limit_minor, available_limit_minor, imported_at \
-                 FROM statement ORDER BY period_end DESC, imported_at DESC",
-                (),
+                 FROM statement WHERE user_id = ? ORDER BY period_end DESC, imported_at DESC",
+                params![user_id],
             )
             .await
             .map_err(backend)?;
@@ -877,10 +913,26 @@ impl TursoStore {
         Ok(out)
     }
 
+    /// Kullanıcı kapsamına yükseltilmiş tek kişilik veriyi (`local`) oturum
+    /// kullanıcısına devreder — ilk OIDC girişinde bir kez çağrılır.
+    pub async fn claim_local(&self, user_id: &str) -> Result<()> {
+        let conn = self.conn.lock().await;
+        for table in TENANT_TABLES {
+            conn.execute(
+                &format!("UPDATE {table} SET user_id = ? WHERE user_id = ?"),
+                params![user_id, LOCAL_USER],
+            )
+            .await
+            .map_err(backend)?;
+        }
+        Ok(())
+    }
+
 }
 
-/// Boş veritabanına bildirilen şemayı kurar; dolu olana bildirilen şema ile
-/// karşılaştırır ve uyuşmazsa reddeder.
+/// Boş veritabanına bildirilen şemayı kurar; dolu olanı önce kullanıcı
+/// kapsamına yükseltir, sonra bildirilen şema ile karşılaştırır ve
+/// uyuşmazsa reddeder.
 async fn migrate(conn: &Connection) -> Result<()> {
     let mut rows = conn
         .query(
@@ -909,6 +961,8 @@ async fn migrate(conn: &Connection) -> Result<()> {
             .map(|_| ());
     }
 
+    upgrade_user_id(conn).await?;
+
     let have = schema::fingerprint(conn).await?;
     let want = schema::declared_fingerprint().await?;
     if have != want {
@@ -919,26 +973,129 @@ async fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-async fn merge_payee_into(conn: &Connection, keeper: &str, extra: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE txn SET payee_id = ? WHERE payee_id = ?",
-        params![keeper, extra],
-    )
-    .await
-    .map_err(backend)?;
-    conn.execute(
-        "DELETE FROM payee_alias WHERE payee_id = ?",
-        params![extra],
-    )
-    .await
-    .map_err(backend)?;
-    conn.execute("DELETE FROM payee WHERE id = ?", params![extra])
+/// `user_id` öncesi şemayla kurulmuş veritabanlarını yükseltir: sütunu
+/// eksik olan her kiracı tablo bildirilen tanımla yeniden kurulur, satırlar
+/// `user_id = 'local'` ile taşınır. Kopya tek işlemde, yabancı anahtarlar
+/// kapalıyken yapılır — id'ler korunduğundan bütünlük bozulmaz.
+async fn upgrade_user_id(conn: &Connection) -> Result<()> {
+    let declared = schema::schema_sql();
+    let mut stale: Vec<&str> = Vec::new();
+    for table in TENANT_TABLES {
+        if !column_names(conn, table).await?.iter().any(|c| c == "user_id") {
+            stale.push(table);
+        }
+    }
+    if stale.is_empty() {
+        return Ok(());
+    }
+
+    conn.execute("PRAGMA foreign_keys = OFF", ())
         .await
         .map_err(backend)?;
+    conn.execute("BEGIN IMMEDIATE", ()).await.map_err(backend)?;
+    let mut failure = None;
+    for table in &stale {
+        if let Err(e) = rebuild_table(conn, &declared, table).await {
+            failure = Some(e);
+            break;
+        }
+    }
+    match failure {
+        None => {
+            conn.execute("COMMIT", ()).await.map_err(backend)?;
+        }
+        Some(e) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            let _ = conn.execute("PRAGMA foreign_keys = ON", ()).await;
+            return Err(e);
+        }
+    }
+    conn.execute("PRAGMA foreign_keys = ON", ())
+        .await
+        .map_err(backend)?;
+    Ok(())
+}
+
+/// Tek tabloyu bildirilen tanımla yeniden kurar ve satırları `local`
+/// kiracıya atar. Aşamalı kopya: `t__migrate` yaratılır, satırlar taşınır,
+/// eski tablo düşülür, aşama tablosu asıl adına döner — şema metninin tek
+/// kaynağı geçiş dosyası kalır.
+async fn rebuild_table(conn: &Connection, declared: &str, table: &str) -> Result<()> {
+    let ddl = schema::table_ddl(declared, table)
+        .ok_or_else(|| backend(format!("bildirilen şemada {table} tanımı yok")))?;
+    let head = format!("CREATE TABLE {table}");
+    if !ddl.starts_with(&head) {
+        return Err(backend(format!("{table} için beklenmeyen tanım: {ddl}")));
+    }
+    let cols = column_names(conn, table).await?;
+    let staged = format!("{table}__migrate");
+    let staged_ddl = format!("CREATE TABLE {staged}{}", &ddl[head.len()..]);
+
+    conn.execute(&staged_ddl, ()).await.map_err(backend)?;
+    let col_sql = cols.join(", ");
+    conn.execute(
+        &format!("INSERT INTO {staged} (user_id, {col_sql}) SELECT ?, {col_sql} FROM {table}"),
+        params![LOCAL_USER],
+    )
+    .await
+    .map_err(backend)?;
+    conn.execute(&format!("DROP TABLE {table}"), ())
+        .await
+        .map_err(backend)?;
+    conn.execute(
+        &format!("ALTER TABLE {staged} RENAME TO {table}"),
+        (),
+    )
+    .await
+    .map_err(backend)?;
+    for index_ddl in schema::index_ddls(declared, table) {
+        conn.execute(&index_ddl, ()).await.map_err(backend)?;
+    }
+    Ok(())
+}
+
+/// Tablo sütun adları, tanım sırasında (`PRAGMA table_info`).
+async fn column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut rows = conn
+        .query(&format!("PRAGMA table_info({table})"), ())
+        .await
+        .map_err(backend)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(backend)? {
+        out.push(row.get::<String>(1).map_err(backend)?);
+    }
+    drop(rows);
+    Ok(out)
+}
+
+async fn merge_payee_into(
+    conn: &Connection,
+    user_id: &str,
+    keeper: &str,
+    extra: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE txn SET payee_id = ? WHERE payee_id = ? AND user_id = ?",
+        params![keeper, extra, user_id],
+    )
+    .await
+    .map_err(backend)?;
+    conn.execute(
+        "DELETE FROM payee_alias WHERE payee_id = ? AND user_id = ?",
+        params![extra, user_id],
+    )
+    .await
+    .map_err(backend)?;
+    conn.execute(
+        "DELETE FROM payee WHERE id = ? AND user_id = ?",
+        params![extra, user_id],
+    )
+    .await
+    .map_err(backend)?;
     let now = now_text();
     conn.execute(
-        "INSERT OR IGNORE INTO payee_alias (merchant_norm, payee_id, created_at) \
-         SELECT DISTINCT merchant_norm, ?, ? FROM txn WHERE payee_id = ?",
+        "INSERT OR IGNORE INTO payee_alias (user_id, merchant_norm, payee_id, created_at) \
+         SELECT DISTINCT user_id, merchant_norm, ?, ? FROM txn WHERE payee_id = ?",
         params![keeper, now.as_str(), keeper],
     )
     .await
@@ -947,7 +1104,7 @@ async fn merge_payee_into(conn: &Connection, keeper: &str, extra: &str) -> Resul
 }
 
 /// Eski `merchant_norm` değerlerini (USD tutarlı POS) yeniden katlar,
-/// aynı gövdeye düşen payee'leri birleştirir.
+/// aynı gövdeye düşen payee'leri kiracı başına birleştirir.
 async fn rekey_merchants(conn: &Connection) -> Result<()> {
     let mut rows = conn
         .query("SELECT DISTINCT merchant_raw FROM txn", ())
@@ -970,8 +1127,8 @@ async fn rekey_merchants(conn: &Connection) -> Result<()> {
 
     let mut rows = conn
         .query(
-            "SELECT merchant_norm, MIN(payee_id) FROM txn \
-             WHERE payee_id IS NOT NULL GROUP BY merchant_norm \
+            "SELECT user_id, merchant_norm, MIN(payee_id) FROM txn \
+             WHERE payee_id IS NOT NULL GROUP BY user_id, merchant_norm \
              HAVING COUNT(DISTINCT payee_id) > 1",
             (),
         )
@@ -979,13 +1136,14 @@ async fn rekey_merchants(conn: &Connection) -> Result<()> {
         .map_err(backend)?;
     let mut unify = Vec::new();
     while let Some(row) = rows.next().await.map_err(backend)? {
-        unify.push((text(&row, 0)?, text(&row, 1)?));
+        unify.push((text(&row, 0)?, text(&row, 1)?, text(&row, 2)?));
     }
     drop(rows);
-    for (norm, keeper) in unify {
+    for (user_id, norm, keeper) in unify {
         conn.execute(
-            "UPDATE txn SET payee_id = ? WHERE merchant_norm = ? AND payee_id IS NOT NULL",
-            params![keeper.as_str(), norm.as_str()],
+            "UPDATE txn SET payee_id = ? WHERE user_id = ? AND merchant_norm = ? \
+             AND payee_id IS NOT NULL",
+            params![keeper.as_str(), user_id.as_str(), norm.as_str()],
         )
         .await
         .map_err(backend)?;
@@ -996,9 +1154,9 @@ async fn rekey_merchants(conn: &Connection) -> Result<()> {
         .map_err(backend)?;
     let now = now_text();
     conn.execute(
-        "INSERT INTO payee_alias (merchant_norm, payee_id, created_at) \
-         SELECT merchant_norm, MIN(payee_id), ? FROM txn \
-         WHERE payee_id IS NOT NULL GROUP BY merchant_norm",
+        "INSERT INTO payee_alias (user_id, merchant_norm, payee_id, created_at) \
+         SELECT user_id, merchant_norm, MIN(payee_id), ? FROM txn \
+         WHERE payee_id IS NOT NULL GROUP BY user_id, merchant_norm",
         params![now.as_str()],
     )
     .await
@@ -1006,21 +1164,22 @@ async fn rekey_merchants(conn: &Connection) -> Result<()> {
 
     let mut rows = conn
         .query(
-            "SELECT name, MIN(id) FROM payee GROUP BY name HAVING COUNT(*) > 1",
+            "SELECT user_id, name, MIN(id) FROM payee GROUP BY user_id, name \
+             HAVING COUNT(*) > 1",
             (),
         )
         .await
         .map_err(backend)?;
     let mut dups = Vec::new();
     while let Some(row) = rows.next().await.map_err(backend)? {
-        dups.push((text(&row, 0)?, text(&row, 1)?));
+        dups.push((text(&row, 0)?, text(&row, 1)?, text(&row, 2)?));
     }
     drop(rows);
-    for (name, keeper) in dups {
+    for (user_id, name, keeper) in dups {
         let mut extras = conn
             .query(
-                "SELECT id FROM payee WHERE name = ? AND id != ?",
-                params![name.as_str(), keeper.as_str()],
+                "SELECT id FROM payee WHERE user_id = ? AND name = ? AND id != ?",
+                params![user_id.as_str(), name.as_str(), keeper.as_str()],
             )
             .await
             .map_err(backend)?;
@@ -1030,7 +1189,7 @@ async fn rekey_merchants(conn: &Connection) -> Result<()> {
         }
         drop(extras);
         for extra in extra_ids {
-            merge_payee_into(conn, &keeper, &extra).await?;
+            merge_payee_into(conn, &user_id, &keeper, &extra).await?;
         }
     }
 
@@ -1046,11 +1205,13 @@ async fn rekey_merchants(conn: &Connection) -> Result<()> {
 
 async fn insert_statement(
     conn: &Connection,
+    user_id: &str,
     statement_id: &str,
     head: &StatementHead,
 ) -> Result<()> {
     let vals = vec![
         text_val(statement_id),
+        text_val(user_id),
         text_val(&head.source_sha256),
         text_val(&head.period_end),
         opt_text(&head.next_period_end),
@@ -1068,12 +1229,12 @@ async fn insert_statement(
         text_val(&now_text()),
     ];
     conn.execute(
-        "INSERT INTO statement (id, source_sha256, period_end, next_period_end, due_date, \
-                                next_due_date, previous_balance_minor, spend_minor, \
-                                fees_minor, payments_minor, period_debt_minor, \
+        "INSERT INTO statement (id, user_id, source_sha256, period_end, next_period_end, \
+                                due_date, next_due_date, previous_balance_minor, \
+                                spend_minor, fees_minor, payments_minor, period_debt_minor, \
                                 period_debt_usd_minor, min_pay_minor, card_limit_minor, \
                                 available_limit_minor, imported_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params_from_iter(vals),
     )
     .await
@@ -1081,12 +1242,17 @@ async fn insert_statement(
     Ok(())
 }
 
-async fn insert_txn(conn: &Connection, statement_id: &str, txn: &ParsedTxn) -> Result<()> {
+async fn insert_txn(
+    conn: &Connection,
+    user_id: &str,
+    statement_id: &str,
+    txn: &ParsedTxn,
+) -> Result<()> {
     // Takma ad eşleşirse işlem doğduğu an etiketli doğar.
     let mut rows = conn
         .query(
-            "SELECT payee_id FROM payee_alias WHERE merchant_norm = ?",
-            params![txn.merchant_norm.as_str()],
+            "SELECT payee_id FROM payee_alias WHERE user_id = ? AND merchant_norm = ?",
+            params![user_id, txn.merchant_norm.as_str()],
         )
         .await
         .map_err(backend)?;
@@ -1098,6 +1264,7 @@ async fn insert_txn(conn: &Connection, statement_id: &str, txn: &ParsedTxn) -> R
 
     let vals = vec![
         text_val(&new_id()),
+        text_val(user_id),
         text_val(statement_id),
         int_val(txn.row_index),
         text_val(&txn.date),
@@ -1113,10 +1280,10 @@ async fn insert_txn(conn: &Connection, statement_id: &str, txn: &ParsedTxn) -> R
         opt_text(&alias_payee),
     ];
     conn.execute(
-        "INSERT INTO txn (id, statement_id, row_index, date, merchant_raw, merchant_norm, \
-                          extra, amount_minor, direction, usd_minor, bankkart_lira_minor, \
-                          card_last4, kind, payee_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO txn (id, user_id, statement_id, row_index, date, merchant_raw, \
+                          merchant_norm, extra, amount_minor, direction, usd_minor, \
+                          bankkart_lira_minor, card_last4, kind, payee_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params_from_iter(vals),
     )
     .await
@@ -1126,11 +1293,16 @@ async fn insert_txn(conn: &Connection, statement_id: &str, txn: &ParsedTxn) -> R
 
 /// "Kart ödemesi" payee'sini (gerekirse kurar) ve tüccar takma adını yazar,
 /// sonra bu normdaki etiketsiz işlemleri ona bağlar.
-async fn link_payment_norm(conn: &Connection, norm: &str, statement_id: &str) -> Result<()> {
+async fn link_payment_norm(
+    conn: &Connection,
+    user_id: &str,
+    norm: &str,
+    statement_id: &str,
+) -> Result<()> {
     let mut rows = conn
         .query(
-            "SELECT id FROM payee WHERE name = ?",
-            params![PAYEE_CARD_PAYMENT],
+            "SELECT id FROM payee WHERE user_id = ? AND name = ?",
+            params![user_id, PAYEE_CARD_PAYMENT],
         )
         .await
         .map_err(backend)?;
@@ -1139,8 +1311,9 @@ async fn link_payment_norm(conn: &Connection, norm: &str, statement_id: &str) ->
         None => {
             let id = new_id();
             conn.execute(
-                "INSERT INTO payee (id, name, category_id, created_at) VALUES (?, ?, ?, ?)",
-                params![id.as_str(), PAYEE_CARD_PAYMENT, CAT_ODEME, now_text()],
+                "INSERT INTO payee (id, user_id, name, category_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+                params![id.as_str(), user_id, PAYEE_CARD_PAYMENT, CAT_ODEME, now_text()],
             )
             .await
             .map_err(backend)?;
@@ -1150,17 +1323,18 @@ async fn link_payment_norm(conn: &Connection, norm: &str, statement_id: &str) ->
     drop(rows);
 
     conn.execute(
-        "INSERT INTO payee_alias (merchant_norm, payee_id, created_at) VALUES (?, ?, ?) \
-         ON CONFLICT(merchant_norm) DO UPDATE SET payee_id = excluded.payee_id",
-        params![norm, payee_id.as_str(), now_text()],
+        "INSERT INTO payee_alias (user_id, merchant_norm, payee_id, created_at) \
+         VALUES (?, ?, ?, ?) ON CONFLICT(user_id, merchant_norm) \
+         DO UPDATE SET payee_id = excluded.payee_id",
+        params![user_id, norm, payee_id.as_str(), now_text()],
     )
     .await
     .map_err(backend)?;
 
     conn.execute(
-        "UPDATE txn SET payee_id = ? WHERE statement_id = ? AND merchant_norm = ? \
-         AND payee_id IS NULL",
-        params![payee_id.as_str(), statement_id, norm],
+        "UPDATE txn SET payee_id = ? WHERE statement_id = ? AND user_id = ? \
+         AND merchant_norm = ? AND payee_id IS NULL",
+        params![payee_id.as_str(), statement_id, user_id, norm],
     )
     .await
     .map_err(backend)?;
@@ -1185,15 +1359,15 @@ async fn count_labeled(conn: &Connection, statement_id: &str) -> Result<(usize, 
     Ok(out)
 }
 
-async fn statement_by_id(conn: &Connection, id: &str) -> Result<StatementRow> {
+async fn statement_by_id(conn: &Connection, user_id: &str, id: &str) -> Result<StatementRow> {
     let mut rows = conn
         .query(
             "SELECT id, source_sha256, period_end, next_period_end, due_date, \
                     next_due_date, previous_balance_minor, spend_minor, fees_minor, \
                     payments_minor, period_debt_minor, period_debt_usd_minor, \
                     min_pay_minor, card_limit_minor, available_limit_minor, imported_at \
-             FROM statement WHERE id = ?",
-            params![id],
+             FROM statement WHERE id = ? AND user_id = ?",
+            params![id, user_id],
         )
         .await
         .map_err(backend)?;
@@ -1205,15 +1379,16 @@ async fn statement_by_id(conn: &Connection, id: &str) -> Result<StatementRow> {
     statement_from(&row)
 }
 
-async fn latest_statement(conn: &Connection) -> Result<Option<StatementRow>> {
+async fn latest_statement(conn: &Connection, user_id: &str) -> Result<Option<StatementRow>> {
     let mut rows = conn
         .query(
             "SELECT id, source_sha256, period_end, next_period_end, due_date, \
                     next_due_date, previous_balance_minor, spend_minor, fees_minor, \
                     payments_minor, period_debt_minor, period_debt_usd_minor, \
                     min_pay_minor, card_limit_minor, available_limit_minor, imported_at \
-             FROM statement ORDER BY period_end DESC, imported_at DESC LIMIT 1",
-            (),
+             FROM statement WHERE user_id = ? \
+             ORDER BY period_end DESC, imported_at DESC LIMIT 1",
+            params![user_id],
         )
         .await
         .map_err(backend)?;
@@ -1254,13 +1429,17 @@ fn category_from(row: &Row) -> Result<Category> {
     })
 }
 
-/// `statement_id` odağı için SQL parçası ve bağlı değerleri. `None` odağın
-/// "hepsi" anlamına geldiği yerlerde `WHERE 1 = 1` ile bitişir.
-fn scope_clause(statement_id: Option<&str>) -> (String, Vec<Value>) {
-    match statement_id {
-        Some(id) => (" AND t.statement_id = ?".to_string(), vec![text_val(id)]),
-        None => (String::new(), Vec::new()),
+/// `user_id` (hep basılı) ve opsiyonel `statement_id` odağı için SQL
+/// parçası ve bağlı değerler. Odaksız kullanım `WHERE 1 = 1` ile biten
+/// sorgulara eklenir.
+fn scope_clause(user_id: &str, statement_id: Option<&str>) -> (String, Vec<Value>) {
+    let mut clause = " AND t.user_id = ?".to_string();
+    let mut vals = vec![text_val(user_id)];
+    if let Some(id) = statement_id {
+        clause.push_str(" AND t.statement_id = ?");
+        vals.push(text_val(id));
     }
+    (clause, vals)
 }
 
 /// `path`in yanına sonek ekler: veritabanının WAL/SHM kardeşleri.

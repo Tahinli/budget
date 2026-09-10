@@ -1,8 +1,9 @@
 //! budget-web: topcoat sunucusu ve ekstre içe aktarım CLI'ı.
 //!
-//! Argümansız `budget-web` sunucudur; `budget-web import <ekstre.html>`
-//! dosyayı çözüp depoya yazar ve raporu basar — çözüm ya da uzlaşma
-//! hatasında 2 ile çıkar. Tarayıcısız canlı duman testi tam olarak budur.
+//! Argümansız `budget-web` sunucudur; oturum im ile OIDC üzerinden gelir.
+//! `budget-web import --user <sub> <ekstre.html>` dosyayı o kişinin
+//! verisine yazar ve raporu basar — çözüm ya da uzlaşma hatasında 2 ile
+//! çıkar. Tarayıcısız canlı duman testi tam olarak budur.
 
 mod config;
 mod i18n;
@@ -32,9 +33,9 @@ const USAGE: &str = "\
 budget-web — Ziraat Katılım harcama takibi
 
 KULLANIM:
-  budget-web                     sunucuyu config/budget.toml ile başlatır
-  budget-web import <DOSYA>      ekstreyi çözüp depoya yazar, rapor basar
-  budget-web help                bu yardım
+  budget-web                              sunucuyu config/budget.toml ile başlatır
+  budget-web import --user <sub> <DOSYA>  ekstreyi o kişinin verisine yazar, rapor basar
+  budget-web help                         bu yardım
 ";
 
 use layout::tr_money;
@@ -53,10 +54,34 @@ async fn main() {
     }
 }
 
-/// `budget-web import <path>`: ekstreyi depoya yazar. Çözüm/uzlaşma
-/// hatasında çıkış 2; depo hatalarında 1.
+/// `budget-web import --user <sub> <path>`: ekstreyi o kişinin verisine
+/// yazar. `--user` zorunludur; çözüm/uzlaşma hatasında çıkış 2, depo
+/// hatalarında 1.
 async fn import_cli(args: &[String]) {
-    let Some(path) = args.first() else {
+    let mut user: Option<&str> = None;
+    let mut paths: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--user" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("budget import: --user bir değer ister\n{USAGE}");
+                    std::process::exit(2);
+                };
+                user = Some(value.as_str());
+                i += 2;
+            }
+            other => {
+                paths.push(other);
+                i += 1;
+            }
+        }
+    }
+    let Some(user) = user else {
+        eprintln!("budget import: --user <sub> zorunlu — veri kişilere ayrıldı\n{USAGE}");
+        std::process::exit(2);
+    };
+    let Some(path) = paths.first() else {
         eprintln!("budget import: ekstre dosyası gerekli\n{USAGE}");
         std::process::exit(2);
     };
@@ -97,7 +122,7 @@ async fn import_cli(args: &[String]) {
             std::process::exit(1);
         }
     };
-    match store.import(parsed).await {
+    match store.import(user, parsed).await {
         Ok(report) if report.duplicate => {
             println!(
                 "kopya    bu ekstre zaten yüklü ({} işlem), yeni kayıt yazılmadı",
@@ -125,6 +150,16 @@ async fn serve() {
             std::process::exit(2);
         }
     };
+    if config.oidc.client_id.is_empty() {
+        eprintln!("budget    [oidc] client_id boş — sunucu im ile açılmaz");
+        eprintln!("budget    im'de istemci açın:");
+        eprintln!(
+            "budget      im-web create-client budget {}",
+            config.oidc.redirect_uri
+        );
+        eprintln!("budget    çıkan client_id ve client_secret'i config/budget.toml [oidc] altına yazın");
+        std::process::exit(2);
+    }
     for line in config.report() {
         println!("budget    {line}");
     }
@@ -152,15 +187,43 @@ async fn serve() {
             .expect("veritabanı açılamadı"),
     );
 
-    let router = Router::builder()
-        .discover()
-        .runtime()
-        // Ekstre yüklemeleri 8 MB'ı aşabilir; sınır /import'ta gevşetilir.
-        .layer(BodyLimit::max(8 * 1024 * 1024).at("/import"))
-        .cookies()
-        .assets(bundle)
-        .app_context(store)
-        .build();
+    // Oturum çerezlerini mühürleyen anahtar veritabanının yanında durur:
+    // veritabanı yedekle gezer, anahtar gezmaz.
+    let key_path = config
+        .database
+        .parent()
+        .map(|parent| parent.join("budget.key"))
+        .unwrap_or_else(|| std::path::PathBuf::from("budget.key"));
+    let cookie_key = match server::load_or_create_key(&key_path) {
+        Ok(key) => key,
+        Err(err) => {
+            eprintln!("budget: {} yüklenemedi: {err}", key_path.display());
+            std::process::exit(2);
+        }
+    };
+    let oidc = im_client::Config {
+        issuer: config.oidc.issuer.clone(),
+        client_id: config.oidc.client_id.clone(),
+        client_secret: config.oidc.client_secret.clone(),
+        redirect_uri: config.oidc.redirect_uri.clone(),
+        cookie_name: "budget_session".to_string(),
+        cookie_key,
+    };
+
+    // /auth/* yolları im-client'tan gelir: mount istemciyi router'a koyar,
+    // discover() yolları işler. Diğer her yol kişi ister.
+    let router = im_client::mount(
+        Router::builder()
+            .discover()
+            .runtime()
+            // Ekstre yüklemeleri 8 MB'ı aşabilir; sınır /import'ta gevşetilir.
+            .layer(BodyLimit::max(8 * 1024 * 1024).at("/import"))
+            .cookies()
+            .assets(bundle),
+        oidc,
+    )
+    .app_context(store)
+    .build();
 
     // `topcoat::start` HOST/PORT'u ortamdan okur; dinleme adresi
     // config/budget.toml kararıdır, açıkça bağlanır.

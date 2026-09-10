@@ -10,6 +10,7 @@ repository = "https://github.com/Tahinli/budget.git"
 
 [workspace.dependencies]
 budget-core = { path = "crates/budget-core" }
+im-client = { git = "https://github.com/DizeyLab/im", rev = "3bc2d0088ac9b51f3050af900bb937a37bc0486d" }
 thiserror = "2.0.20"
 ulid = "3"
 time = { version = "0.3.55", features = ["formatting"] }
@@ -37,3 +38,9 @@ topcoat = { version = "0.8.0", default-features = false, features = [
 [profile.release]
 codegen-units = 1
 lto = true
+
+# Deploy profile: thin LTO, parallel codegen. Fat LTO stays on `release`.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 16

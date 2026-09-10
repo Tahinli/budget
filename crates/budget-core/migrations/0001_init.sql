@@ -1,6 +1,9 @@
 -- budget şeması — 0001: kategori, payee, takma ad, ekstre ve işlem.
 -- Ekstre HTML'i saklanmaz; yalnızca görselleri soyulmuş baytların
 -- SHA-256'sı (`source_sha256`) mükerrer içe aktarım için tutulur.
+--
+-- `user_id` kiracı anahtarıdır (im OIDC `sub` değeri); payee, takma ad,
+-- ekstre ve işlem satırları kullanıcıya kilitlidir. Kategoriler globaldir.
 
 CREATE TABLE category (
     id    TEXT PRIMARY KEY,
@@ -12,20 +15,24 @@ CREATE TABLE category (
 
 CREATE TABLE payee (
     id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
     name        TEXT NOT NULL,
     category_id TEXT NOT NULL REFERENCES category(id),
     created_at  TEXT NOT NULL
 );
 
 CREATE TABLE payee_alias (
-    merchant_norm TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    merchant_norm TEXT NOT NULL,
     payee_id      TEXT NOT NULL REFERENCES payee(id),
-    created_at    TEXT NOT NULL
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (user_id, merchant_norm)
 );
 
 CREATE TABLE statement (
     id                      TEXT PRIMARY KEY,
-    source_sha256           TEXT NOT NULL UNIQUE,
+    user_id                 TEXT NOT NULL,
+    source_sha256           TEXT NOT NULL,
     period_end              TEXT NOT NULL,
     next_period_end         TEXT,
     due_date                TEXT,
@@ -39,11 +46,13 @@ CREATE TABLE statement (
     min_pay_minor           INTEGER NOT NULL DEFAULT 0,
     card_limit_minor        INTEGER,
     available_limit_minor   INTEGER,
-    imported_at             TEXT NOT NULL
+    imported_at             TEXT NOT NULL,
+    UNIQUE (user_id, source_sha256)
 );
 
 CREATE TABLE txn (
     id                  TEXT PRIMARY KEY,
+    user_id             TEXT NOT NULL,
     statement_id        TEXT NOT NULL REFERENCES statement(id),
     row_index           INTEGER NOT NULL,
     date                TEXT NOT NULL,
@@ -60,9 +69,9 @@ CREATE TABLE txn (
     UNIQUE(statement_id, row_index)
 );
 
-CREATE INDEX txn_norm ON txn(merchant_norm);
-CREATE INDEX txn_date ON txn(date);
-CREATE INDEX txn_payee ON txn(payee_id);
+CREATE INDEX txn_norm ON txn(user_id, merchant_norm);
+CREATE INDEX txn_date ON txn(user_id, date);
+CREATE INDEX txn_payee ON txn(user_id, payee_id);
 
 -- Tohum kategoriler: sabit ULID'ler — testler ve arayüz bu id'lere çakılıdır.
 INSERT OR IGNORE INTO category (id, name, kind, color, sort) VALUES

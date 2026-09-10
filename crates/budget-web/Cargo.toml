@@ -9,9 +9,11 @@ description = "budget web uygulaması: topcoat iskeleti ve ekstre içe aktarım 
 [dependencies]
 budget-core.workspace = true
 topcoat.workspace = true
+im-client.workspace = true
 tokio.workspace = true
 serde.workspace = true
 toml.workspace = true
+rand = "0.10"
 # Önyüklemede paketin stil baytları, ikiliye derlenen parmak iziyle
 # karşılaştırılır: başka derlemenin paketi açılışı reddettirir.
 sha2 = "0.11.0"
