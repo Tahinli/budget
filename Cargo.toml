@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/budget-core", "crates/budget-web"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Tahinli/budget.git"
+
+[workspace.dependencies]
+budget-core = { path = "crates/budget-core" }
+thiserror = "2.0.20"
+ulid = "3"
+time = { version = "0.3.55", features = ["formatting"] }
+tokio = { version = "1.53.1", features = ["full"] }
+turso = "=0.8.0-pre.10"
+sha2 = "0.11.0"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1"
+# Ziraat Katılım ekstre HTML'i regex ile değil gerçek bir HTML ayrıştırıcıyla
+# çözülür; scraper ailenin seçtiği html5ever sarmalayıcısı.
+scraper = "0.23"
+topcoat = { version = "0.8.0", default-features = false, features = [
+  "router",
+  "view",
+  "runtime",
+  "asset",
+  "cookie",
+  "discover",
+  "serve",
+  "compression",
+  "multipart",
+  "sse",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true

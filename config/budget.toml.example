@@ -1,0 +1,6 @@
+# budget yapılandırması. `budget-web` ilk açılışta bu içeriği CWD altındaki
+# `config/budget.toml`'a yazar; değiştirmek için dosyayı düzenin.
+# Veritabanı ve storage yolları CWD'ye göredir.
+database = "budget.db"
+storage = "storage"
+listen = "127.0.0.1:7656"

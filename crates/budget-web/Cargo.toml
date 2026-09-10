@@ -1,0 +1,21 @@
+[package]
+name = "budget-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "budget web uygulaması: topcoat iskeleti ve ekstre içe aktarım CLI'ı"
+
+[dependencies]
+budget-core.workspace = true
+topcoat.workspace = true
+tokio.workspace = true
+serde.workspace = true
+toml.workspace = true
+# Önyüklemede paketin stil baytları, ikiliye derlenen parmak iziyle
+# karşılaştırılır: başka derlemenin paketi açılışı reddettirir.
+sha2 = "0.11.0"
+
+[build-dependencies]
+grass = "0.13"
+sha2 = "0.11.0"

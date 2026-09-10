@@ -1,0 +1,16 @@
+[package]
+name = "budget-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "budget çekirdeği: Ziraat Katılım ekstre ayrıştırıcı ve turso deposu"
+
+[dependencies]
+turso.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+time.workspace = true
+sha2.workspace = true
+scraper.workspace = true
