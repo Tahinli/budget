@@ -4,3 +4,10 @@
 database = "budget.db"
 storage = "storage"
 listen = "127.0.0.1:7656"
+
+[oidc]
+# im-web create-client budget http://127.0.0.1:7656/auth/callback
+issuer = "http://127.0.0.1:7650"
+client_id = ""
+client_secret = ""
+redirect_uri = "http://127.0.0.1:7656/auth/callback"
