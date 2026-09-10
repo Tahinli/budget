@@ -163,12 +163,21 @@ pub struct TxnRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct MerchantHit {
+    pub date: String,
+    pub amount_minor: i64,
+    pub direction: Direction,
+    pub extra: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct MerchantGroup {
     pub merchant_norm: String,
     pub sample_raw: String,
     pub count: i64,
     pub debit_minor: i64,
     pub credit_minor: i64,
+    pub hits: Vec<MerchantHit>,
 }
 
 #[derive(Debug, Clone)]
@@ -326,30 +335,58 @@ impl TursoStore {
     }
 
     /// Etiketsiz işlemleri `merchant_norm` başına gruplar; gelen kutusunun
-    /// satırlarıdır.
+    /// satırlarıdır. Her grup, tarihe göre yeni→eski işlem listesini taşır.
     pub async fn unlabeled_groups(&self) -> Result<Vec<MerchantGroup>> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT merchant_norm, MIN(merchant_raw), COUNT(*), \
-                        SUM(CASE WHEN direction = 'debit' THEN amount_minor ELSE 0 END), \
-                        SUM(CASE WHEN direction = 'credit' THEN amount_minor ELSE 0 END) \
+                "SELECT merchant_norm, merchant_raw, extra, date, amount_minor, direction \
                  FROM txn WHERE payee_id IS NULL \
-                 GROUP BY merchant_norm ORDER BY COUNT(*) DESC, merchant_norm",
+                 ORDER BY date DESC, row_index DESC",
                 (),
             )
             .await
             .map_err(backend)?;
-        let mut out = Vec::new();
+        let mut by_norm: HashMap<String, MerchantGroup> = HashMap::new();
         while let Some(row) = rows.next().await.map_err(backend)? {
-            out.push(MerchantGroup {
-                merchant_norm: text(&row, 0)?,
-                sample_raw: text(&row, 1)?,
-                count: int_of(&row, 2)?,
-                debit_minor: int_of(&row, 3)?,
-                credit_minor: int_of(&row, 4)?,
+            let merchant_norm = text(&row, 0)?;
+            let merchant_raw = text(&row, 1)?;
+            let extra = text(&row, 2)?;
+            let date = text(&row, 3)?;
+            let amount_minor = int_of(&row, 4)?;
+            let direction = Direction::from_db(&text(&row, 5)?)
+                .ok_or_else(|| backend("bilinmeyen yön"))?;
+            let group = by_norm.entry(merchant_norm.clone()).or_insert_with(|| {
+                MerchantGroup {
+                    merchant_norm,
+                    sample_raw: merchant_raw.clone(),
+                    count: 0,
+                    debit_minor: 0,
+                    credit_minor: 0,
+                    hits: Vec::new(),
+                }
+            });
+            if merchant_raw < group.sample_raw {
+                group.sample_raw = merchant_raw;
+            }
+            match direction {
+                Direction::Debit => group.debit_minor += amount_minor,
+                Direction::Credit => group.credit_minor += amount_minor,
+            }
+            group.count += 1;
+            group.hits.push(MerchantHit {
+                date,
+                amount_minor,
+                direction,
+                extra,
             });
         }
+        let mut out: Vec<MerchantGroup> = by_norm.into_values().collect();
+        out.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.merchant_norm.cmp(&b.merchant_norm))
+        });
         Ok(out)
     }
 

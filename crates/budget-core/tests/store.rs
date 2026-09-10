@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use budget_core::parse::{merchant_norm, parse_ziraat_html, TxnKind};
+use budget_core::parse::{merchant_norm, parse_ziraat_html, Direction, TxnKind};
 use budget_core::store::{TursoStore, TxnFilter, CAT_IADE, CAT_MARKET, CAT_ODEME};
 use ulid::Ulid;
 
@@ -150,6 +150,25 @@ async fn dashboard_unlabeled_groups_and_seed_categories()
     assert_eq!(market.count, 1);
     assert_eq!(market.debit_minor, 25_000);
     assert_eq!(market.credit_minor, 0);
+    assert_eq!(market.hits.len(), 1);
+    assert_eq!(market.hits[0].date, "2026-08-10");
+    assert_eq!(market.hits[0].amount_minor, 25_000);
+    assert_eq!(market.hits[0].direction, Direction::Debit);
+
+    let taksit_norm = merchant_norm("ORNEK TAKSIT MAGZA");
+    let taksit = groups
+        .iter()
+        .find(|g| g.merchant_norm == taksit_norm)
+        .expect("taksit grubu");
+    assert_eq!(taksit.count, 2);
+    assert_eq!(
+        taksit
+            .hits
+            .iter()
+            .map(|h| (h.date.as_str(), h.amount_minor))
+            .collect::<Vec<_>>(),
+        vec![("2026-08-22", 75_000), ("2026-08-22", 75_000)]
+    );
 
     let dash = store.dashboard(None).await.expect("pano");
     assert!(dash.statement.is_some());

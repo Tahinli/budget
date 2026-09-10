@@ -500,6 +500,17 @@ async fn inbox(cx: &Cx) -> Result<Response> {
                     <strong>(g.sample_raw.clone())</strong>
                     <span class="muted num">(format!("{} {}", g.count, t(lang, Key::TxnsWord)))</span>
                 </div>
+                <ul class="payee-sources">
+                    for h in g.hits {
+                        <li>
+                            <span class="num">(h.date.clone())</span>
+                            <span class=(amount_class(h.direction))>(amount_parts(h.direction, h.amount_minor))</span>
+                            if !h.extra.is_empty() {
+                                <span class="muted">(h.extra.clone())</span>
+                            }
+                        </li>
+                    }
+                </ul>
                 <div class="muted num">
                     (format!(
                         "{} {} · {} {}",
@@ -551,13 +562,17 @@ async fn inbox_label(cx: &Cx, Form(input): Form<LabelForm>) -> Result<Response> 
     see_other(back).into_response(cx)
 }
 
-fn amount_text(t: &TxnRow) -> String {
-    let base = layout::tr_money(t.amount_minor);
-    if t.direction == Direction::Credit {
+fn amount_parts(direction: Direction, amount_minor: i64) -> String {
+    let base = layout::tr_money(amount_minor);
+    if direction == Direction::Credit {
         format!("+{base}")
     } else {
         base
     }
+}
+
+fn amount_text(t: &TxnRow) -> String {
+    amount_parts(t.direction, t.amount_minor)
 }
 
 fn amount_class(direction: Direction) -> Option<&'static str> {
