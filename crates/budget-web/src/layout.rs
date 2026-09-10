@@ -200,9 +200,7 @@ fn nav_class(mine: Nav, active: Nav) -> Option<&'static str> {
 /// etiketlenmemiş işlem sayısı rozeti ve sayfanın kendi sahnesi.
 ///
 /// Rozet her sayfada aynı kuralı izler: gelen kutusunun gruplarındaki
-/// işlem sayılarının toplamı — kişinin kendi verisinde. Oturum yoksa
-/// rozet de kişinin adı da çerez çıkışı da yoktur; menü yine durur, çünkü
-/// her yol girişe döndürür.
+/// işlem sayılarının toplamı.
 pub(crate) async fn shell<'a>(
     cx: &'a Cx,
     lang: Lang,
@@ -210,17 +208,12 @@ pub(crate) async fn shell<'a>(
     active: Nav,
     stage: Child<'a>,
 ) -> Result<impl View + 'a> {
-    let user = server::current_user(cx).await.clone();
-    let unlabeled: i64 = match &user {
-        Some(user) => server::store(cx)
-            .unlabeled_groups(&user.sub)
-            .await?
-            .iter()
-            .map(|g| g.count)
-            .sum(),
-        None => 0,
-    };
-    let name = user.as_ref().map(|user| user.name.clone());
+    let unlabeled: i64 = server::store(cx)
+        .unlabeled_groups()
+        .await?
+        .iter()
+        .map(|g| g.count)
+        .sum();
     let en = lang == Lang::En;
     Ok(view! {
         cx =>
@@ -248,10 +241,6 @@ pub(crate) async fn shell<'a>(
                         <a class=(en.then_some("active")) href="/lang/en">"EN"</a>
                         <a class=((!en).then_some("active")) href="/lang/tr">"TR"</a>
                     </span>
-                    if let Some(name) = name {
-                        <span class="muted">(name)</span>
-                        <a href="/auth/logout">(t(lang, Key::SignOut))</a>
-                    }
                 </nav>
                 <main class="stage">
                     (stage)
