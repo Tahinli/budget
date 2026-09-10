@@ -137,9 +137,14 @@ fn norm_folds_turkish_and_strips_trailing_city()
         merchant_norm("BIM V020 30 AGUSTOS KAYSERI"),
         "BIM V020 30 AGUSTOS"
     );
-    // Tüm satır şehirse dokunulmaz.
     assert_eq!(merchant_norm("KAYSERI"), "KAYSERI");
     assert_eq!(merchant_norm("A  B\tC"), "A B C");
+    assert_eq!(
+        merchant_norm("STRIPE-Z.AI USD 18.00"),
+        merchant_norm("STRIPE-Z.AI USD 68.97")
+    );
+    assert_eq!(merchant_norm("STRIPE-Z.AI USD 18.00"), "STRIPE-Z.AI");
+    assert_eq!(merchant_norm("GITHUB USD 13.71"), "GITHUB");
 }
 
 #[test]

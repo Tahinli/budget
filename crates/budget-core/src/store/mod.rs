@@ -23,7 +23,8 @@ use turso::{params, Connection, Row, Value};
 use ulid::Ulid;
 
 use crate::parse::{
-    Direction, ParseResult, ParsedTxn, StatementHead, TxnKind, PAYMENT_NORM,
+    merchant_norm, merchant_stem_display, Direction, ParseResult, ParsedTxn, StatementHead,
+    TxnKind, PAYMENT_NORM,
 };
 
 /// Kart ödemesi payee'sinin adı; içe aktarımda tohum takma adı buna bağlanır.
@@ -109,9 +110,14 @@ pub struct PayeeRow {
     pub name: String,
     pub category_id: String,
     pub created_at: String,
-    /// Distinct `merchant_raw` strings from ekstras bound to this payee,
-    /// with how many txns used that exact extra text.
-    pub sources: Vec<(String, i64)>,
+    pub sources: Vec<PayeeSource>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PayeeSource {
+    pub display: String,
+    pub merchant_norm: String,
+    pub count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +236,7 @@ impl TursoStore {
             conn.execute(pragma, ()).await.map_err(backend)?;
         }
         migrate(&conn).await?;
+        rekey_merchants(&conn).await?;
         if !is_memory {
             // Turso ana dosyanın yanına WAL/SHM bırakabilir; hepsi aynı
             // kurala bağlanır: varsa 0600.
@@ -456,6 +463,30 @@ impl TursoStore {
             if name.is_empty() {
                 return Err(StoreError::NotFound("payee adı boş".into()));
             }
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM payee WHERE name = ? AND id != ?",
+                    params![name, payee_id],
+                )
+                .await
+                .map_err(backend)?;
+            let other = match rows.next().await.map_err(backend)? {
+                Some(row) => Some(row.get::<String>(0).map_err(backend)?),
+                None => None,
+            };
+            drop(rows);
+            if let Some(keeper) = other {
+                merge_payee_into(&conn, &keeper, payee_id).await?;
+                if let Some(category_id) = category_id {
+                    conn.execute(
+                        "UPDATE payee SET category_id = ? WHERE id = ?",
+                        params![category_id, keeper.as_str()],
+                    )
+                    .await
+                    .map_err(backend)?;
+                }
+                return Ok(());
+            }
             let changed = conn
                 .execute(
                     "UPDATE payee SET name = ? WHERE id = ?",
@@ -493,6 +524,73 @@ impl TursoStore {
         }
         Ok(())
     }
+
+    /// Payee'nin bütün etiketini kaldırır: işlemler gelen kutusuna döner.
+    pub async fn clear_payee(&self, payee_id: &str) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE txn SET payee_id = NULL WHERE payee_id = ?",
+            params![payee_id],
+        )
+        .await
+        .map_err(backend)?;
+        conn.execute(
+            "DELETE FROM payee_alias WHERE payee_id = ?",
+            params![payee_id],
+        )
+        .await
+        .map_err(backend)?;
+        let n = conn
+            .execute("DELETE FROM payee WHERE id = ?", params![payee_id])
+            .await
+            .map_err(backend)?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("payee {payee_id}")));
+        }
+        Ok(())
+    }
+
+    /// Tek bir POS gövdesini payee'den koparır.
+    pub async fn clear_source(&self, payee_id: &str, merchant_norm: &str) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE txn SET payee_id = NULL WHERE payee_id = ? AND merchant_norm = ?",
+            params![payee_id, merchant_norm],
+        )
+        .await
+        .map_err(backend)?;
+        conn.execute(
+            "DELETE FROM payee_alias WHERE payee_id = ? AND merchant_norm = ?",
+            params![payee_id, merchant_norm],
+        )
+        .await
+        .map_err(backend)?;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM txn WHERE payee_id = ?",
+                params![payee_id],
+            )
+            .await
+            .map_err(backend)?;
+        let left = match rows.next().await.map_err(backend)? {
+            Some(row) => int_of(&row, 0)?,
+            None => 0,
+        };
+        drop(rows);
+        if left == 0 {
+            conn.execute(
+                "DELETE FROM payee_alias WHERE payee_id = ?",
+                params![payee_id],
+            )
+            .await
+            .map_err(backend)?;
+            conn.execute("DELETE FROM payee WHERE id = ?", params![payee_id])
+                .await
+                .map_err(backend)?;
+        }
+        Ok(())
+    }
+
 
     /// Gösterge panosu. `statement_id` verilmezse bütün geçmiş ölçülür;
     /// verilen ekstre yoksa `NotFound`.
@@ -605,8 +703,7 @@ impl TursoStore {
             where_sql.push_str(" AND t.payee_id IS NULL");
         }
         if let Some(q) = &f.q {
-            where_sql
-                .push_str(" AND (t.merchant_raw LIKE ? OR t.merchant_norm LIKE ?)");
+            where_sql.push_str(" AND (t.merchant_raw LIKE ? OR t.merchant_norm LIKE ?)");
             let needle = format!("%{q}%");
             vals.push(text_val(&needle));
             vals.push(text_val(&needle));
@@ -693,20 +790,25 @@ impl TursoStore {
 
         let mut src_rows = conn
             .query(
-                "SELECT payee_id, merchant_raw, COUNT(*) \
+                "SELECT payee_id, merchant_norm, COUNT(*), MIN(merchant_raw) \
                  FROM txn WHERE payee_id IS NOT NULL \
-                 GROUP BY payee_id, merchant_raw \
-                 ORDER BY COUNT(*) DESC, merchant_raw",
+                 GROUP BY payee_id, merchant_norm \
+                 ORDER BY COUNT(*) DESC, merchant_norm",
                 (),
             )
             .await
             .map_err(backend)?;
-        let mut by_payee: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+        let mut by_payee: HashMap<String, Vec<PayeeSource>> = HashMap::new();
         while let Some(row) = src_rows.next().await.map_err(backend)? {
             let id = text(&row, 0)?;
-            let raw = text(&row, 1)?;
+            let norm = text(&row, 1)?;
             let n = int_of(&row, 2)?;
-            by_payee.entry(id).or_default().push((raw, n));
+            let raw = text(&row, 3)?;
+            by_payee.entry(id).or_default().push(PayeeSource {
+                display: merchant_stem_display(&raw),
+                merchant_norm: norm,
+                count: n,
+            });
         }
         drop(src_rows);
         for p in &mut out {
@@ -737,6 +839,7 @@ impl TursoStore {
         drop(rows);
         Ok(out)
     }
+
 }
 
 /// Boş veritabanına bildirilen şemayı kurar; dolu olana bildirilen şema ile
@@ -778,6 +881,131 @@ async fn migrate(conn: &Connection) -> Result<()> {
     }
     Ok(())
 }
+
+async fn merge_payee_into(conn: &Connection, keeper: &str, extra: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE txn SET payee_id = ? WHERE payee_id = ?",
+        params![keeper, extra],
+    )
+    .await
+    .map_err(backend)?;
+    conn.execute(
+        "DELETE FROM payee_alias WHERE payee_id = ?",
+        params![extra],
+    )
+    .await
+    .map_err(backend)?;
+    conn.execute("DELETE FROM payee WHERE id = ?", params![extra])
+        .await
+        .map_err(backend)?;
+    let now = now_text();
+    conn.execute(
+        "INSERT OR IGNORE INTO payee_alias (merchant_norm, payee_id, created_at) \
+         SELECT DISTINCT merchant_norm, ?, ? FROM txn WHERE payee_id = ?",
+        params![keeper, now.as_str(), keeper],
+    )
+    .await
+    .map_err(backend)?;
+    Ok(())
+}
+
+/// Eski `merchant_norm` değerlerini (USD tutarlı POS) yeniden katlar,
+/// aynı gövdeye düşen payee'leri birleştirir.
+async fn rekey_merchants(conn: &Connection) -> Result<()> {
+    let mut rows = conn
+        .query("SELECT DISTINCT merchant_raw FROM txn", ())
+        .await
+        .map_err(backend)?;
+    let mut raws = Vec::new();
+    while let Some(row) = rows.next().await.map_err(backend)? {
+        raws.push(text(&row, 0)?);
+    }
+    drop(rows);
+    for raw in &raws {
+        let norm = merchant_norm(raw);
+        conn.execute(
+            "UPDATE txn SET merchant_norm = ? WHERE merchant_raw = ?",
+            params![norm.as_str(), raw.as_str()],
+        )
+        .await
+        .map_err(backend)?;
+    }
+
+    let mut rows = conn
+        .query(
+            "SELECT merchant_norm, MIN(payee_id) FROM txn \
+             WHERE payee_id IS NOT NULL GROUP BY merchant_norm \
+             HAVING COUNT(DISTINCT payee_id) > 1",
+            (),
+        )
+        .await
+        .map_err(backend)?;
+    let mut unify = Vec::new();
+    while let Some(row) = rows.next().await.map_err(backend)? {
+        unify.push((text(&row, 0)?, text(&row, 1)?));
+    }
+    drop(rows);
+    for (norm, keeper) in unify {
+        conn.execute(
+            "UPDATE txn SET payee_id = ? WHERE merchant_norm = ? AND payee_id IS NOT NULL",
+            params![keeper.as_str(), norm.as_str()],
+        )
+        .await
+        .map_err(backend)?;
+    }
+
+    conn.execute("DELETE FROM payee_alias", ())
+        .await
+        .map_err(backend)?;
+    let now = now_text();
+    conn.execute(
+        "INSERT INTO payee_alias (merchant_norm, payee_id, created_at) \
+         SELECT merchant_norm, MIN(payee_id), ? FROM txn \
+         WHERE payee_id IS NOT NULL GROUP BY merchant_norm",
+        params![now.as_str()],
+    )
+    .await
+    .map_err(backend)?;
+
+    let mut rows = conn
+        .query(
+            "SELECT name, MIN(id) FROM payee GROUP BY name HAVING COUNT(*) > 1",
+            (),
+        )
+        .await
+        .map_err(backend)?;
+    let mut dups = Vec::new();
+    while let Some(row) = rows.next().await.map_err(backend)? {
+        dups.push((text(&row, 0)?, text(&row, 1)?));
+    }
+    drop(rows);
+    for (name, keeper) in dups {
+        let mut extras = conn
+            .query(
+                "SELECT id FROM payee WHERE name = ? AND id != ?",
+                params![name.as_str(), keeper.as_str()],
+            )
+            .await
+            .map_err(backend)?;
+        let mut extra_ids = Vec::new();
+        while let Some(row) = extras.next().await.map_err(backend)? {
+            extra_ids.push(text(&row, 0)?);
+        }
+        drop(extras);
+        for extra in extra_ids {
+            merge_payee_into(conn, &keeper, &extra).await?;
+        }
+    }
+
+    conn.execute(
+        "DELETE FROM payee WHERE id NOT IN (SELECT DISTINCT payee_id FROM txn WHERE payee_id IS NOT NULL)",
+        (),
+    )
+    .await
+    .map_err(backend)?;
+    Ok(())
+}
+
 
 async fn insert_statement(
     conn: &Connection,

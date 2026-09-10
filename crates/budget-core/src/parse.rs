@@ -647,7 +647,7 @@ fn fold_char(c: char) -> char {
 }
 
 /// Tüccar eşleştirme anahtarı: beyaz alan katlanır, Türkçe büyük harfe
-/// katlanır, sondaki şehir belirteci (tüm satır şehir değilse) soyulur.
+/// katlanır, sondaki şehir ve `USD 18.00` kuyruğu soyulur.
 /// `merchant_raw` gösterim için dokunulmadan kalır; eşleştirme yalnızca bu
 /// anahtarla yapılır.
 pub fn merchant_norm(raw: &str) -> String {
@@ -662,7 +662,56 @@ pub fn merchant_norm(raw: &str) -> String {
     while tokens.len() > 1 && CITY_TOKENS.contains(&tokens.last().copied().unwrap_or_default()) {
         tokens.pop();
     }
+    strip_fx_tokens(&mut tokens);
     tokens.join(" ")
+}
+
+/// Gösterim: ham POS metninden yalnızca kuyruktaki döviz tutarı düşer,
+/// büyük harfe katlanmaz.
+pub fn merchant_stem_display(raw: &str) -> String {
+    let mut tokens: Vec<&str> = raw.split_whitespace().collect();
+    strip_fx_tokens(&mut tokens);
+    tokens.join(" ")
+}
+
+fn strip_fx_tokens(tokens: &mut Vec<&str>) {
+    while tokens.len() > 1 {
+        let last = *tokens.last().unwrap_or(&"");
+        if !is_fx_amount(last) {
+            break;
+        }
+        if tokens.len() >= 2 && is_fx_ccy(tokens[tokens.len() - 2]) {
+            tokens.pop();
+            tokens.pop();
+            continue;
+        }
+        break;
+    }
+}
+
+fn is_fx_ccy(tok: &str) -> bool {
+    matches!(
+        tok,
+        "USD" | "EUR" | "GBP" | "TRY" | "TL" | "CHF" | "usd" | "eur" | "gbp" | "try" | "tl" | "chf"
+    )
+}
+
+fn is_fx_amount(tok: &str) -> bool {
+    let mut saw_digit = false;
+    let mut seps = 0u8;
+    for c in tok.chars() {
+        if c.is_ascii_digit() {
+            saw_digit = true;
+        } else if c == '.' || c == ',' {
+            seps = seps.saturating_add(1);
+            if seps > 1 {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    saw_digit
 }
 
 /// `1.234,56`, `1.234,56+`, `0,00`, `18.619,06 TL` → (kuruş, kredi mi).

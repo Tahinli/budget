@@ -270,6 +270,24 @@ form.inline {
 .payee-sources li {
   margin-top: 2px;
   word-break: break-word;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.linkish {
+  font: inherit;
+  color: var(--accent);
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.payee-sources .linkish {
+  margin-left: 6px;
 }
 
 form.inline[data-autosubmit] {

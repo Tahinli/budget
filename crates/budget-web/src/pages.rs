@@ -728,12 +728,20 @@ async fn payees(cx: &Cx) -> Result<Response> {
                                 if !p.sources.is_empty() {
                                     <div class="field-label">(t(lang, Key::OnStatement))</div>
                                     <ul class="payee-sources">
-                                        for (raw, n) in p.sources.clone() {
+                                        for s in p.sources.clone() {
                                             <li>
-                                                (raw.clone())
-                                                if n > 1 {
-                                                    <span>(format!(" · {n}"))</span>
+                                                (s.display.clone())
+                                                if s.count > 1 {
+                                                    <span>(format!(" · {}", s.count))</span>
                                                 }
+                                                <form class="inline" method="post"
+                                                    action=(format!("/payees/{}/source", p.id))>
+                                                    <input type="hidden" name="merchant_norm"
+                                                        value=(s.merchant_norm.clone())>
+                                                    <button class="linkish" type="submit">
+                                                        (t(lang, Key::ClearSource))
+                                                    </button>
+                                                </form>
                                             </li>
                                         }
                                     </ul>
@@ -747,6 +755,10 @@ async fn payees(cx: &Cx) -> Result<Response> {
                                         </option>
                                     }
                                 </select>
+                                <form class="inline" method="post"
+                                    action=(format!("/payees/{}/clear", p.id))>
+                                    <button class="linkish" type="submit">(t(lang, Key::Clear))</button>
+                                </form>
                             </td>
                         </tr>
                     }
@@ -771,6 +783,33 @@ async fn payee_update(cx: &Cx, Form(input): Form<PayeeForm>) -> Result<Response>
         .update_payee(id, Some(&input.name), Some(&input.category))
         .await
     {
+        Ok(()) => "/payees",
+        Err(_) => "/payees?error=depo",
+    };
+    see_other(back).into_response(cx)
+}
+
+#[derive(Deserialize)]
+struct SourceForm {
+    merchant_norm: String,
+}
+
+#[route(POST "/payees/{payee_id}/clear")]
+async fn payee_clear(cx: &Cx) -> Result<Response> {
+    let store = server::store(cx);
+    let id: &str = path_param::<PayeeId>(cx);
+    let back = match store.clear_payee(id).await {
+        Ok(()) => "/payees",
+        Err(_) => "/payees?error=depo",
+    };
+    see_other(back).into_response(cx)
+}
+
+#[route(POST "/payees/{payee_id}/source")]
+async fn payee_clear_source(cx: &Cx, Form(input): Form<SourceForm>) -> Result<Response> {
+    let store = server::store(cx);
+    let id: &str = path_param::<PayeeId>(cx);
+    let back = match store.clear_source(id, &input.merchant_norm).await {
         Ok(()) => "/payees",
         Err(_) => "/payees?error=depo",
     };
