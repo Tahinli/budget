@@ -436,16 +436,56 @@ impl TursoStore {
     }
 
     pub async fn set_payee_category(&self, payee_id: &str, category_id: &str) -> Result<()> {
+        self.update_payee(payee_id, None, Some(category_id)).await
+    }
+
+    /// Payee adını ve/veya kategorisini yazar. Boş ad reddedilir.
+    pub async fn update_payee(
+        &self,
+        payee_id: &str,
+        name: Option<&str>,
+        category_id: Option<&str>,
+    ) -> Result<()> {
         let conn = self.conn.lock().await;
-        let changed = conn
-            .execute(
-                "UPDATE payee SET category_id = ? WHERE id = ?",
-                params![category_id, payee_id],
-            )
-            .await
-            .map_err(backend)?;
-        if changed == 0 {
-            return Err(StoreError::NotFound(format!("payee {payee_id}")));
+        if let Some(name) = name {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(StoreError::NotFound("payee adı boş".into()));
+            }
+            let changed = conn
+                .execute(
+                    "UPDATE payee SET name = ? WHERE id = ?",
+                    params![name, payee_id],
+                )
+                .await
+                .map_err(backend)?;
+            if changed == 0 {
+                return Err(StoreError::NotFound(format!("payee {payee_id}")));
+            }
+        }
+        if let Some(category_id) = category_id {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM category WHERE id = ?",
+                    params![category_id],
+                )
+                .await
+                .map_err(backend)?;
+            let exists = rows.next().await.map_err(backend)?.is_some();
+            drop(rows);
+            if !exists {
+                return Err(StoreError::NotFound(format!("kategori {category_id}")));
+            }
+            let changed = conn
+                .execute(
+                    "UPDATE payee SET category_id = ? WHERE id = ?",
+                    params![category_id, payee_id],
+                )
+                .await
+                .map_err(backend)?;
+            if changed == 0 {
+                return Err(StoreError::NotFound(format!("payee {payee_id}")));
+            }
         }
         Ok(())
     }

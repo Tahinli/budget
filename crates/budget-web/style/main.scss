@@ -78,6 +78,17 @@ td {
   background: #16212b;
 }
 
+.lang {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+}
+
+.lang a {
+  font-size: 12px;
+  letter-spacing: 0.04em;
+}
+
 .badge {
   display: inline-block;
   margin-left: 6px;
@@ -101,6 +112,13 @@ td {
 
 .empty {
   color: var(--muted);
+}
+
+.inbox-head {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  justify-content: space-between;
 }
 
 // Göstergeler: dört kartın tek ızgarası.
@@ -216,6 +234,40 @@ form.inline {
   gap: 8px;
   align-items: center;
   margin-top: 10px;
+}
+
+.file {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #16212b;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  cursor: pointer;
+}
+
+.file-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}
+
+.file-name {
+  min-width: 0;
+}
+
+.payee-name {
+  min-width: 180px;
+}
+
+form.inline[data-autosubmit] {
+  margin-top: 0;
 }
 
 // Sonuç bantları: yeşil başarı, kırmızı sorun; uzlaşma tablosu sorunla gelir.

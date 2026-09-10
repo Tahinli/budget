@@ -1,6 +1,5 @@
-//! Pano, içe aktarım, gelen kutusu, işlemler ve payeeler — bütün sayfa
-//! işleyicileri. Sayfalar düz HTML formudur: POST sert gider, 303 ile
-//! döner; hata kodları URL'den taşınır, cümle asla taşınmaz.
+//! Pano, içe aktarım, gelen kutusu, işlemler ve payeeler.
+//! POST sert gider, 303 ile döner; hata kodları URL'den taşınır.
 
 use serde::Deserialize;
 
@@ -8,37 +7,43 @@ use budget_core::parse::{Direction, ParseError, parse_ziraat_html};
 use budget_core::store::{TxnFilter, TxnRow};
 use topcoat::Result;
 use topcoat::context::Cx;
+use topcoat::cookie::{Cookie, Cookies, cookies};
 use topcoat::router::content::Form;
 use topcoat::router::content::multipart::Multipart;
 use topcoat::router::error::see_other;
-use topcoat::router::request::uri;
+use topcoat::router::header;
+use topcoat::router::request::{headers, uri};
 use topcoat::router::response::{IntoResponse, Response};
 use topcoat::router::{path_param, route};
 use topcoat::view::{Child, ViewExt, view};
 
+use crate::i18n::{Key, Lang, category_label, kind_label, lang_of, t, tf};
 use crate::layout::{self, Bar, Nav};
 use crate::server;
 
 path_param!(payee_id);
+path_param!(code);
 
-/// `/import` yüklemesi `BodyLimit` ile aynı tavanı paylaşır.
 const IMPORT_LIMIT: usize = 8 * 1024 * 1024;
 
-/// Sahneyi kabuğa sarıp yanıtla — her işleyicinin tek çıkış kapısı.
-async fn respond(cx: &Cx, nav: Nav, title: &str, stage: impl topcoat::view::View) -> Result<Response> {
-    layout::shell(cx, title, nav, Child::new(stage))
+async fn respond(
+    cx: &Cx,
+    nav: Nav,
+    title: &str,
+    stage: impl topcoat::view::View,
+) -> Result<Response> {
+    let lang = lang_of(cx);
+    layout::shell(cx, lang, title, nav, Child::new(stage))
         .await?
         .first()
         .await?
         .into_response(cx)
 }
 
-/// Sorgu dizesinin tamamı; `uri(cx)`'in tek okunuş burada dursun.
 fn current_query(cx: &Cx) -> String {
     uri(cx).query().unwrap_or("").to_string()
 }
 
-/// Sorgudan tek anahtarın değeri (`+` boşluk, form stili).
 fn query_value(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
@@ -46,89 +51,129 @@ fn query_value(query: &str, key: &str) -> Option<String> {
     })
 }
 
-/// Percent-decoder; sorgu değerleri küçüktür, tahsis sorunu değil.
 fn urldecode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
     let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'+' => {
-                out.push(b' ');
+                out.push(' ');
                 i += 1;
             }
             b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
-                match u8::from_str_radix(hex, 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(b'%');
-                        i += 1;
-                    }
+                let hi = bytes[i + 1];
+                let lo = bytes[i + 2];
+                if let (Some(h), Some(l)) = (from_hex(hi), from_hex(lo)) {
+                    out.push(char::from(h * 16 + l));
+                    i += 3;
+                } else {
+                    out.push('%');
+                    i += 1;
                 }
             }
-            byte => {
-                out.push(byte);
+            b => {
+                out.push(char::from(b));
                 i += 1;
             }
         }
     }
-    String::from_utf8(out).unwrap_or_default()
+    out
 }
 
-// ---------------------------------------------------------------------------
-// GET / — gösterge panosu
-// ---------------------------------------------------------------------------
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn safe_back(cx: &Cx) -> String {
+    let Some(raw) = headers(cx)
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return "/".into();
+    };
+    let path = if let Some(idx) = raw.find("://") {
+        let rest = &raw[idx + 3..];
+        match rest.find('/') {
+            Some(slash) => &rest[slash..],
+            None => "/",
+        }
+    } else if raw.starts_with('/') {
+        raw
+    } else {
+        return "/".into();
+    };
+    let path = path.split('#').next().unwrap_or("/");
+    if !path.starts_with('/') || path.starts_with("//") || path.starts_with("/lang/") {
+        return "/".into();
+    }
+    path.to_string()
+}
+
+#[route(GET "/lang/{code}")]
+async fn set_lang(cx: &Cx) -> Result<Response> {
+    let raw: &str = path_param::<Code>(cx);
+    let lang = Lang::from_code(raw);
+    cookies(cx).add(
+        Cookie::build(("budget_lang", lang.code()))
+            .path("/")
+            .build(),
+    );
+    see_other(safe_back(cx)).into_response(cx)
+}
 
 #[route(GET "/")]
 async fn home(cx: &Cx) -> Result<Response> {
+    let lang = lang_of(cx);
     let store = server::store(cx);
     let statements = store.statements().await?;
     if statements.is_empty() {
         let stage = view! {
             cx =>
-            <h1 class="page-title">"Pano"</h1>
+            <h1 class="page-title">(t(lang, Key::TitleHome))</h1>
             <section class="card empty">
-                <p>"Henüz ekstre yüklenmedi."</p>
-                <p><a class="button" href="/import">"İlk ekstreyi içe aktar"</a></p>
+                <p>(t(lang, Key::EmptyNoStatement))</p>
+                <p><a class="button" href="/import">(t(lang, Key::FirstImport))</a></p>
             </section>
         };
-        return respond(cx, Nav::Home, "Pano", stage).await;
+        return respond(cx, Nav::Home, t(lang, Key::TitleHome), stage).await;
     }
 
     let query = current_query(cx);
     let picked = match query_value(&query, "d") {
         Some(id) if statements.iter().any(|s| s.id == id) => Some(id),
-        // Varsayılan en yeni dönemdir: `statements` period_end'e göre
-        // azalan dizili gelir.
         _ => statements.first().map(|s| s.id.clone()),
     };
     let dash = store.dashboard(picked.as_deref()).await?;
     let st = dash.statement.as_ref().expect("seçili dönem ekstresi vardır");
 
-    // Tek SVG yardımcısına giden üç seri: kategoriler (kendi renkleri +
-    // etiketsiz kovası), aylar ve en çok harcanan payeeler.
     let mut cat_bars: Vec<Bar> = dash
         .spend_by_category
         .iter()
         .filter(|(_, minor)| *minor > 0)
-        .map(|(c, minor)| Bar {
-            label: c.name.clone(),
-            minor: *minor,
-            text: layout::tr_money(*minor),
-            title: format!("{} · {}", c.name, layout::tr_money(*minor)),
-            color: c.color.clone(),
+        .map(|(c, minor)| {
+            let name = category_label(lang, &c.id, &c.name);
+            Bar {
+                label: name.clone(),
+                minor: *minor,
+                text: layout::tr_money(*minor),
+                title: format!("{} · {}", name, layout::tr_money(*minor)),
+                color: c.color.clone(),
+            }
         })
         .collect();
     if dash.unlabeled_debit_minor > 0 {
+        let name = t(lang, Key::UnlabeledBar);
         cat_bars.push(Bar {
-            label: "Etiketsiz".into(),
+            label: name.into(),
             minor: dash.unlabeled_debit_minor,
             text: layout::tr_money(dash.unlabeled_debit_minor),
-            title: format!("Etiketsiz · {}", layout::tr_money(dash.unlabeled_debit_minor)),
+            title: format!("{name} · {}", layout::tr_money(dash.unlabeled_debit_minor)),
             color: "#64748b".into(),
         });
     }
@@ -140,8 +185,11 @@ async fn home(cx: &Cx) -> Result<Response> {
             minor: *spend,
             text: layout::tr_money(*spend),
             title: format!(
-                "{month} · harcama {} · ödeme {}",
+                "{} · {} {} · {} {}",
+                month,
+                t(lang, Key::Spend),
                 layout::tr_money(*spend),
+                t(lang, Key::Payments),
                 layout::tr_money(*credits)
             ),
             color: "#5eead4".into(),
@@ -163,91 +211,88 @@ async fn home(cx: &Cx) -> Result<Response> {
     let month_svg = layout::svg_bars(&month_bars, true);
     let payee_svg = layout::svg_bars(&payee_bars, false);
 
-    // Dönem seçenekleri: boş değer bütün geçmişi ölçer; aksi halde tek
-    // ekstreye sıkışır.
     let mut options: Vec<(String, String, bool)> = Vec::with_capacity(statements.len() + 1);
     options.push((
         String::new(),
-        "Tüm dönemler (tüm geçmiş)".into(),
+        t(lang, Key::AllPeriodsHistory).into(),
         picked.is_none(),
     ));
     for s in &statements {
         options.push((
             s.id.clone(),
-            format!("Dönem {} · borç {}", s.period_end, layout::tr_money(s.period_debt_minor)),
+            format!(
+                "{} {} · {}",
+                t(lang, Key::Period),
+                s.period_end,
+                layout::tr_money(s.period_debt_minor)
+            ),
             picked.as_deref() == Some(s.id.as_str()),
         ));
     }
 
     let stage = view! {
         cx =>
-        <h1 class="page-title">"Pano"</h1>
+        <h1 class="page-title">(t(lang, Key::TitleHome))</h1>
         <form class="toolbar" method="get" action="/">
             <label class="field">
-                <span class="field-label">"Dönem"</span>
+                <span class="field-label">(t(lang, Key::Period))</span>
                 <select name="d">
                     for (id, text, sel) in options {
                         <option value=(id) if sel { selected="" }>(text)</option>
                     }
                 </select>
             </label>
-            <button class="button" type="submit">"Göster"</button>
+            <button class="button" type="submit">(t(lang, Key::Show))</button>
         </form>
         <section class="kpis">
             <div class="card kpi">
-                <div class="kpi-label">"Dönem borcu"</div>
+                <div class="kpi-label">(t(lang, Key::PeriodDebt))</div>
                 <div class="kpi-value num">(layout::tr_money(st.period_debt_minor))</div>
             </div>
             <div class="card kpi">
-                <div class="kpi-label">"Harcamalar"</div>
+                <div class="kpi-label">(t(lang, Key::Spend))</div>
                 <div class="kpi-value num">(layout::tr_money(st.spend_minor))</div>
             </div>
             <div class="card kpi">
-                <div class="kpi-label">"Ödemeler"</div>
+                <div class="kpi-label">(t(lang, Key::Payments))</div>
                 <div class="kpi-value num">(layout::tr_money(st.payments_minor))</div>
             </div>
             <div class="card kpi">
-                <div class="kpi-label">"Etiketlenmemiş"</div>
-                <div class="kpi-value num">(dash.unlabeled_count.to_string())" işlem"</div>
+                <div class="kpi-label">(t(lang, Key::Unlabeled))</div>
+                <div class="kpi-value num">(format!("{} {}", dash.unlabeled_count, t(lang, Key::TxnsWord)))</div>
                 <div class="kpi-sub num">(layout::tr_money(dash.unlabeled_debit_minor))</div>
             </div>
         </section>
         <div class="grid-2">
             <section class="card">
-                <h2>"Kategoriler"</h2>
+                <h2>(t(lang, Key::Categories))</h2>
                 if cat_svg.is_empty() {
-                    <p class="muted">"Bu dönemde harcama yok."</p>
+                    <p class="muted">(t(lang, Key::NoSpendPeriod))</p>
                 } else {
                     (topcoat::view::Unescaped::new_unchecked(cat_svg))
                 }
             </section>
             <section class="card">
-                <h2>"Aylık harcama"</h2>
+                <h2>(t(lang, Key::MonthlySpend))</h2>
                 if month_svg.is_empty() {
-                    <p class="muted">"Harcama yok."</p>
+                    <p class="muted">(t(lang, Key::NoSpend))</p>
                 } else {
                     (topcoat::view::Unescaped::new_unchecked(month_svg))
                 }
             </section>
             <section class="card">
-                <h2>"En çok harcanan payeeler"</h2>
+                <h2>(t(lang, Key::TopPayees))</h2>
                 if payee_svg.is_empty() {
-                    <p class="muted">"Etiketli harcama yok — önce gelen kutusunu boşaltın."</p>
+                    <p class="muted">(t(lang, Key::NoLabeledSpend))</p>
                 } else {
                     (topcoat::view::Unescaped::new_unchecked(payee_svg))
                 }
             </section>
         </div>
     };
-    respond(cx, Nav::Home, "Pano", stage).await
+    respond(cx, Nav::Home, t(lang, Key::TitleHome), stage).await
 }
 
-// ---------------------------------------------------------------------------
-// GET + POST /import — multipart ekstre yüklemesi
-// ---------------------------------------------------------------------------
-
-/// İçe aktarımın geri dönüşünde sayfanın üstünde büyüyen sorun. Uzlaşma
-/// hatası dört sayının tamamını taşır: sözleşme gereği.
 enum ImportProblem {
     NoFile,
     Upload,
@@ -261,19 +306,14 @@ enum ImportProblem {
         stated: i64,
     },
 }
-/// Sorun bantları hazır HTML'dir: dört uzlaşma sayısı tablo olarak çıkar,
-/// view! grameri sade kalır. Dinamik parçalar `esc` ile kaçışlıdır.
-fn problem_banner(problem: &ImportProblem) -> String {
-    let head = |body: String| {
-        format!("<div class=\"banner banner-problem\">{body}</div>")
-    };
+
+fn problem_banner(lang: Lang, problem: &ImportProblem) -> String {
+    let head = |body: String| format!("<div class=\"banner banner-problem\">{body}</div>");
     match problem {
-        ImportProblem::NoFile => head("Dosya seçilmedi.".into()),
-        ImportProblem::Upload => {
-            head("Yükleme okunamadı ya da 8 MB sınırını aştı.".into())
-        }
+        ImportProblem::NoFile => head(t(lang, Key::ErrNoFile).into()),
+        ImportProblem::Upload => head(t(lang, Key::ErrUpload).into()),
         ImportProblem::Parse(reason) => {
-            head(format!("Ekstre çözülemedi: {}", layout::esc(reason)))
+            head(tf(lang, Key::ErrParse, &layout::esc(reason)))
         }
         ImportProblem::Reconcile {
             previous,
@@ -285,46 +325,43 @@ fn problem_banner(problem: &ImportProblem) -> String {
         } => {
             let row = |label: &str, minor: i64| {
                 format!(
-                    "<tr><td>{label}</td><td class=\"num\">{}</td></tr>",
+                    "<tr><td>{}</td><td class=\"num\">{}</td></tr>",
+                    layout::esc(label),
                     layout::tr_money(minor)
                 )
             };
             head(format!(
-                "Uzlaşma tutmuyor — ekstrenin dip özeti işlem satırlarıyla \
-                 uyuşmuyor. Hiçbir kayıt yazılmadı.\
-                 <table class=\"recon num\"><tbody>{}{}{}{}{}{}</tbody></table>",
-                row("Önceki bakiye (ÖNCEKİ AYDAN DEVİR)", *previous),
-                row("+ Harcamalarınız", *spend),
-                row("+ Ceza ücret ve kesintiler", *fees),
-                row("− Ödemeleriniz", *credits),
-                row("= Hesaplanan dönem borcu", *computed),
-                row("Ekstrenin yazdığı dönem borcu", *stated),
+                "{}<table class=\"recon num\"><tbody>{}{}{}{}{}{}</tbody></table>",
+                t(lang, Key::ErrReconcile),
+                row(t(lang, Key::ReconPrev), *previous),
+                row(t(lang, Key::ReconSpend), *spend),
+                row(t(lang, Key::ReconFees), *fees),
+                row(t(lang, Key::ReconPay), *credits),
+                row(t(lang, Key::ReconComputed), *computed),
+                row(t(lang, Key::ReconStated), *stated),
             ))
         }
     }
 }
 
-/// Yükleme formu; `ok` ile başarı, `problem` ile hata bandı aynı sahnede.
 async fn import_page(
     cx: &Cx,
     ok: Option<&str>,
     problem: Option<ImportProblem>,
 ) -> Result<Response> {
+    let lang = lang_of(cx);
     let ok_banner = ok.map(|code| {
-        if code == "dupe" {
-            "<div class=\"banner banner-ok\">Bu ekstre zaten yüklü — aynı \
-             özetli dosya hiçbir kayıt yazmaz.</div>"
-                .to_string()
+        let body = if code == "dupe" {
+            t(lang, Key::OkDupe)
         } else {
-            "<div class=\"banner banner-ok\">Ekstre yüklendi. Etiketlenmemiş \
-             işlemleri <a href=\"/inbox\">gelen kutusunda</a> etiketleyin.</div>"
-                .to_string()
-        }
+            t(lang, Key::OkImported)
+        };
+        format!("<div class=\"banner banner-ok\">{body}</div>")
     });
-    let problem_html = problem.as_ref().map(problem_banner);
+    let problem_html = problem.as_ref().map(|p| problem_banner(lang, p));
     let stage = view! {
         cx =>
-        <h1 class="page-title">"İçe aktar"</h1>
+        <h1 class="page-title">(t(lang, Key::TitleImport))</h1>
         if let Some(html) = ok_banner {
             (topcoat::view::Unescaped::new_unchecked(html))
         }
@@ -334,18 +371,22 @@ async fn import_page(
         <section class="card">
             <form method="post" action="/import" enctype="multipart/form-data">
                 <label class="field">
-                    <span class="field-label">"Ziraat Katılım ekstresi (.html)"</span>
-                    <input type="file" name="file" accept=".html,text/html" required="">
+                    <span class="field-label">(t(lang, Key::ImportFileLabel))</span>
+                    <span class="file">
+                        <input class="file-hidden" type="file" name="file"
+                            accept=".html,text/html" required="">
+                        <span class="button">(t(lang, Key::ChooseFile))</span>
+                        <span class="file-name muted" data-empty=(t(lang, Key::NoFileChosen))>
+                            (t(lang, Key::NoFileChosen))
+                        </span>
+                    </span>
                 </label>
-                <button class="button" type="submit">"Yükle"</button>
+                <button class="button" type="submit">(t(lang, Key::Upload))</button>
             </form>
-            <p class="muted">
-                "Dosyanın kendisi saklanmaz: görselleri soyulmuş baytların "
-                "yalnızca SHA-256 özeti tutulur, aynı özetli ikinci yükleme kopya sayılır."
-            </p>
+            <p class="muted">(t(lang, Key::ImportHint))</p>
         </section>
     };
-    respond(cx, Nav::Import, "İçe aktar", stage).await
+    respond(cx, Nav::Import, t(lang, Key::TitleImport), stage).await
 }
 
 #[route(GET "/import")]
@@ -363,8 +404,6 @@ async fn import_post(cx: &Cx, mut multipart: Multipart) -> Result<Response> {
             Ok(None) => break,
             Err(_) => return import_page(cx, None, Some(ImportProblem::Upload)).await,
         };
-        // Yalnızca dosya adı taşıyan alan ekstredir; diğer form alanları
-        // (ileride eklenirse) sessizce atlanır.
         if field.file_name().is_none() {
             continue;
         }
@@ -424,63 +463,67 @@ async fn import_post(cx: &Cx, mut multipart: Multipart) -> Result<Response> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// GET + POST /inbox — etiketleme gelen kutusu
-// ---------------------------------------------------------------------------
-
 #[route(GET "/inbox")]
 async fn inbox(cx: &Cx) -> Result<Response> {
+    let lang = lang_of(cx);
     let store = server::store(cx);
     let groups = store.unlabeled_groups().await?;
     let categories = store.categories().await?;
     let error = query_value(&current_query(cx), "error");
     let error_banner = error.map(|code| {
-        if code == "isim" {
-            "<div class=\"banner banner-problem\">Payee adı boş olamaz.</div>".to_string()
+        let body = if code == "isim" {
+            t(lang, Key::InboxErrName)
         } else {
-            "<div class=\"banner banner-problem\">Etiket depoya yazılamadı.</div>".to_string()
-        }
+            t(lang, Key::InboxErrStore)
+        };
+        format!("<div class=\"banner banner-problem\">{body}</div>")
     });
+    let cat_opts: Vec<(String, String)> = categories
+        .iter()
+        .map(|c| (c.id.clone(), category_label(lang, &c.id, &c.name)))
+        .collect();
 
     let stage = view! {
         cx =>
-        <h1 class="page-title">"Etiketle"</h1>
+        <h1 class="page-title">(t(lang, Key::TitleInbox))</h1>
         if let Some(html) = error_banner {
             (topcoat::view::Unescaped::new_unchecked(html))
         }
         if groups.is_empty() {
             <section class="card empty">
-                <p>"Gelen kutusu boş — bütün işlemler etiketli."</p>
+                <p>(t(lang, Key::InboxEmpty))</p>
             </section>
         }
         for g in groups {
             <section class="card">
                 <div class="inbox-head">
                     <strong>(g.sample_raw.clone())</strong>
-                    <span class="muted num">(g.count.to_string())" işlem"</span>
+                    <span class="muted num">(format!("{} {}", g.count, t(lang, Key::TxnsWord)))</span>
                 </div>
                 <div class="muted num">
                     (format!(
-                        "harcama {} · iade {}",
+                        "{} {} · {} {}",
+                        t(lang, Key::Spend),
                         layout::tr_money(g.debit_minor),
+                        t(lang, Key::KindRefund),
                         layout::tr_money(g.credit_minor)
                     ))
                 </div>
                 <div class="muted">(g.merchant_norm.clone())</div>
                 <form class="inline" method="post" action="/inbox/label">
                     <input type="hidden" name="merchant_norm" value=(g.merchant_norm.clone())>
-                    <input type="text" name="payee" placeholder="Payee adı" required="">
+                    <input type="text" name="payee" placeholder=(t(lang, Key::PayeePlaceholder)) required="">
                     <select name="category">
-                        for c in &categories {
-                            <option value=(c.id.clone())>(c.name.clone())</option>
+                        for (id, name) in &cat_opts {
+                            <option value=(id.clone())>(name.clone())</option>
                         }
                     </select>
-                    <button class="button button-small" type="submit">"Etiketle"</button>
+                    <button class="button button-small" type="submit">(t(lang, Key::Label))</button>
                 </form>
             </section>
         }
     };
-    respond(cx, Nav::Inbox, "Etiketle", stage).await
+    respond(cx, Nav::Inbox, t(lang, Key::TitleInbox), stage).await
 }
 
 #[derive(Deserialize)]
@@ -497,7 +540,10 @@ async fn inbox_label(cx: &Cx, Form(input): Form<LabelForm>) -> Result<Response> 
     let back = if name.is_empty() {
         "/inbox?error=isim"
     } else {
-        match store.label(&input.merchant_norm, name, &input.category).await {
+        match store
+            .label(&input.merchant_norm, name, &input.category)
+            .await
+        {
             Ok(_) => "/inbox",
             Err(_) => "/inbox?error=depo",
         }
@@ -505,11 +551,6 @@ async fn inbox_label(cx: &Cx, Form(input): Form<LabelForm>) -> Result<Response> 
     see_other(back).into_response(cx)
 }
 
-// ---------------------------------------------------------------------------
-// GET /txns — süzülebilir işlem tablosu
-// ---------------------------------------------------------------------------
-
-/// Kredi satırlarının tablodaki imzası: önde `+`, yeşil.
 fn amount_text(t: &TxnRow) -> String {
     let base = layout::tr_money(t.amount_minor);
     if t.direction == Direction::Credit {
@@ -529,11 +570,11 @@ fn amount_class(direction: Direction) -> Option<&'static str> {
 
 #[route(GET "/txns")]
 async fn txns(cx: &Cx) -> Result<Response> {
+    let lang = lang_of(cx);
     let store = server::store(cx);
     let statements = store.statements().await?;
     let categories = store.categories().await?;
 
-    // Süzgeçler sorgudan: boş değer = süzme yok.
     let query = current_query(cx);
     let f_statement = query_value(&query, "d").filter(|id| !id.is_empty());
     let f_category = query_value(&query, "k").filter(|id| !id.is_empty());
@@ -556,7 +597,7 @@ async fn txns(cx: &Cx) -> Result<Response> {
         .map(|s| {
             (
                 s.id.clone(),
-                format!("Dönem {}", s.period_end),
+                format!("{} {}", t(lang, Key::Period), s.period_end),
                 f_statement.as_deref() == Some(s.id.as_str()),
             )
         })
@@ -566,7 +607,7 @@ async fn txns(cx: &Cx) -> Result<Response> {
         .map(|c| {
             (
                 c.id.clone(),
-                c.name.clone(),
+                category_label(lang, &c.id, &c.name),
                 f_category.as_deref() == Some(c.id.as_str()),
             )
         })
@@ -574,120 +615,125 @@ async fn txns(cx: &Cx) -> Result<Response> {
 
     let stage = view! {
         cx =>
-        <h1 class="page-title">"İşlemler"</h1>
+        <h1 class="page-title">(t(lang, Key::TitleTxns))</h1>
         <form class="toolbar" method="get" action="/txns">
             <label class="field">
-                <span class="field-label">"Dönem"</span>
+                <span class="field-label">(t(lang, Key::Period))</span>
                 <select name="d">
-                    <option value="">"Tüm dönemler"</option>
+                    <option value="">(t(lang, Key::AllPeriods))</option>
                     for (id, text, sel) in stmt_opts {
                         <option value=(id) if sel { selected="" }>(text)</option>
                     }
                 </select>
             </label>
             <label class="field">
-                <span class="field-label">"Kategori"</span>
+                <span class="field-label">(t(lang, Key::FilterCategory))</span>
                 <select name="k">
-                    <option value="">"Tüm kategoriler"</option>
+                    <option value="">(t(lang, Key::AllCategories))</option>
                     for (id, text, sel) in cat_opts {
                         <option value=(id) if sel { selected="" }>(text)</option>
                     }
                 </select>
             </label>
             <label class="field">
-                <span class="field-label">"Ara"</span>
-                <input type="search" name="q" placeholder="tüccar adı"
+                <span class="field-label">(t(lang, Key::ColTxn))</span>
+                <input type="search" name="q" placeholder=(t(lang, Key::SearchPlaceholder))
                     value=(f_q.clone().unwrap_or_default())>
             </label>
             <label class="check">
                 <input type="checkbox" name="u" value="1" if f_unlabeled { checked="" }>
-                "Etiketsizler"
+                (t(lang, Key::UnlabeledOnly))
             </label>
-            <button class="button" type="submit">"Süz"</button>
+            <button class="button" type="submit">(t(lang, Key::Filter))</button>
         </form>
-        <p class="muted">(format!("{} işlem", rows.len()))</p>
+        <p class="muted">(format!("{} {}", rows.len(), t(lang, Key::TxnsWord)))</p>
         <section class="card">
             <table>
                 <thead>
                     <tr>
-                        <th>"Tarih"</th>
-                        <th>"İşlem"</th>
-                        <th>"Payee"</th>
-                        <th>"Kategori"</th>
-                        <th>"Tutar"</th>
-                        <th>"Kart"</th>
-                        <th>"Tür"</th>
+                        <th>(t(lang, Key::ColDate))</th>
+                        <th>(t(lang, Key::ColTxn))</th>
+                        <th>(t(lang, Key::ColPayee))</th>
+                        <th>(t(lang, Key::ColCategory))</th>
+                        <th>(t(lang, Key::ColAmount))</th>
+                        <th>(t(lang, Key::ColCard))</th>
+                        <th>(t(lang, Key::ColKind))</th>
                     </tr>
                 </thead>
                 <tbody>
-                    for t in rows {
+                    for row in rows {
                         <tr>
-                            <td class="num">(t.date.clone())</td>
+                            <td class="num">(row.date.clone())</td>
                             <td>
-                                (t.merchant_raw.clone())
-                                if !t.extra.is_empty() {
-                                    <span class="muted">(" · ".to_string() + &t.extra)</span>
+                                (row.merchant_raw.clone())
+                                if !row.extra.is_empty() {
+                                    <span class="muted">(" · ".to_string() + &row.extra)</span>
                                 }
                             </td>
-                            <td>(t.payee_name.clone().unwrap_or_else(|| "—".into()))</td>
-                            <td>(t.category_name.clone().unwrap_or_else(|| "—".into()))</td>
-                            <td class=(amount_class(t.direction))>(amount_text(&t))</td>
-                            <td class="num">("•• ".to_string() + &t.card_last4)</td>
-                            <td class="muted">(layout::kind_label(t.kind))</td>
+                            <td>(row.payee_name.clone().unwrap_or_else(|| "—".into()))</td>
+                            <td>(row.category_id.as_deref().map(|id| {
+                                category_label(lang, id, row.category_name.as_deref().unwrap_or(""))
+                            }).unwrap_or_else(|| "—".into()))</td>
+                            <td class=(amount_class(row.direction))>(amount_text(&row))</td>
+                            <td class="num">("•• ".to_string() + &row.card_last4)</td>
+                            <td class="muted">(kind_label(lang, row.kind))</td>
                         </tr>
                     }
                 </tbody>
             </table>
         </section>
     };
-    respond(cx, Nav::Txns, "İşlemler", stage).await
+    respond(cx, Nav::Txns, t(lang, Key::TitleTxns), stage).await
 }
-
-// ---------------------------------------------------------------------------
-// GET /payees + POST /payees/{payee_id}/category
-// ---------------------------------------------------------------------------
 
 #[route(GET "/payees")]
 async fn payees(cx: &Cx) -> Result<Response> {
+    let lang = lang_of(cx);
     let store = server::store(cx);
     let payees = store.payees().await?;
     let categories = store.categories().await?;
     let error = query_value(&current_query(cx), "error");
+    let cat_opts: Vec<(String, String)> = categories
+        .iter()
+        .map(|c| (c.id.clone(), category_label(lang, &c.id, &c.name)))
+        .collect();
 
     let stage = view! {
         cx =>
-        <h1 class="page-title">"Payeeler"</h1>
+        <h1 class="page-title">(t(lang, Key::TitlePayees))</h1>
         if error.is_some() {
-            <div class="banner banner-problem">"Kategori kaydedilemedi."</div>
+            <div class="banner banner-problem">(t(lang, Key::ErrPayeeSave))</div>
         }
         if payees.is_empty() {
             <section class="card empty">
-                <p>"Henüz payee yok — işlemleri " <a href="/inbox">"gelen kutusunda"</a> " etiketleyin."</p>
+                <p>(t(lang, Key::PayeesEmpty))</p>
             </section>
         }
         <section class="card">
             <table>
                 <thead>
                     <tr>
-                        <th>"Payee"</th>
-                        <th>"Kategori"</th>
+                        <th>(t(lang, Key::ColPayee))</th>
+                        <th>(t(lang, Key::ColCategory))</th>
                     </tr>
                 </thead>
                 <tbody>
                     for p in payees {
                         <tr>
-                            <td>(p.name.clone())</td>
                             <td>
-                                <form class="inline" method="post" action=(format!("/payees/{}/category", p.id))>
-                                    <select name="category">
-                                        for c in &categories {
-                                            <option value=(c.id.clone()) if c.id == p.category_id { selected="" }>
-                                                (c.name.clone())
-                                            </option>
-                                        }
-                                    </select>
-                                    <button class="button button-small" type="submit">"Kaydet"</button>
-                                </form>
+                                <form id=(format!("p-{}", p.id)) method="post"
+                                    action=(format!("/payees/{}", p.id)) data-autosubmit=""></form>
+                                <input class="payee-name" type="text" name="name"
+                                    form=(format!("p-{}", p.id)) value=(p.name.clone()) required="">
+                            </td>
+                            <td>
+                                <select name="category" form=(format!("p-{}", p.id))>
+                                    for (id, name) in &cat_opts {
+                                        <option value=(id.clone()) if *id == p.category_id { selected="" }>
+                                            (name.clone())
+                                        </option>
+                                    }
+                                </select>
                             </td>
                         </tr>
                     }
@@ -695,19 +741,23 @@ async fn payees(cx: &Cx) -> Result<Response> {
             </table>
         </section>
     };
-    respond(cx, Nav::Payees, "Payeeler", stage).await
+    respond(cx, Nav::Payees, t(lang, Key::TitlePayees), stage).await
 }
 
 #[derive(Deserialize)]
-struct CategoryForm {
+struct PayeeForm {
+    name: String,
     category: String,
 }
 
-#[route(POST "/payees/{payee_id}/category")]
-async fn payee_category(cx: &Cx, Form(input): Form<CategoryForm>) -> Result<Response> {
+#[route(POST "/payees/{payee_id}")]
+async fn payee_update(cx: &Cx, Form(input): Form<PayeeForm>) -> Result<Response> {
     let store = server::store(cx);
     let id: &str = path_param::<PayeeId>(cx);
-    let back = match store.set_payee_category(id, &input.category).await {
+    let back = match store
+        .update_payee(id, Some(&input.name), Some(&input.category))
+        .await
+    {
         Ok(()) => "/payees",
         Err(_) => "/payees?error=depo",
     };

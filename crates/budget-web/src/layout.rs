@@ -1,20 +1,75 @@
 //! Her sayfanın üstünden geçtiği belge kabuğu ve tek grafik yardımcısı.
 //!
-//! Sayfalar düz HTML formudur: hidrasyon yok, çalışma anı betiği yok. Tek
-//! stil kaynağı [`STYLE`], tek çubuk grafik yardımcısı [`svg_bars`] —
-//! ikinci bir widget takımı çıkmaz.
+//! Dil çerezi ve `data-autosubmit` dışında çalışma anı çerçevesi yok.
+//! Tek stil kaynağı [`STYLE`], tek çubuk grafik yardımcısı [`svg_bars`].
 
 use topcoat::Result;
 use topcoat::asset::{Asset, asset};
 use topcoat::context::Cx;
-use topcoat::view::{Child, View, view};
+use topcoat::view::{Child, Unescaped, View, view};
 
-use budget_core::parse::TxnKind;
-
+use crate::i18n::{Key, Lang, t};
 use crate::server;
 
 /// `style/main.scss`, `build.rs`'in `assets/main.css`'e derlediği tek stil.
 pub(crate) const STYLE: Asset = asset!("assets/main.css");
+
+/// Payee autosave, dosya adı, gelen kutusu etiketi (yenilemeden kart düşer).
+const SHELL_JS: &str = r#"
+function postForm(form) {
+  var body = new URLSearchParams(new FormData(form));
+  return fetch(form.getAttribute('action'), { method: 'POST', body: body, redirect: 'follow' });
+}
+document.addEventListener('change', function (e) {
+  var el = e.target;
+  if (!el) return;
+  if (el.classList && el.classList.contains('file-hidden')) {
+    var name = (el.files && el.files[0]) ? el.files[0].name : '';
+    var slot = el.parentElement && el.parentElement.querySelector('.file-name');
+    if (slot) slot.textContent = name || slot.getAttribute('data-empty') || '';
+    return;
+  }
+  var form = el.form;
+  if (form && form.hasAttribute('data-autosubmit')) {
+    postForm(form).then(function (res) {
+      if (res.url && res.url.indexOf('error=') !== -1) location.href = res.url;
+    });
+  }
+});
+document.addEventListener('submit', function (e) {
+  var form = e.target;
+  if (!form || form.getAttribute('action') !== '/inbox/label') return;
+  e.preventDefault();
+  var card = form.closest('.card');
+  var countEl = card && card.querySelector('.inbox-head .num');
+  var n = countEl ? parseInt(countEl.textContent, 10) : 0;
+  if (isNaN(n)) n = 0;
+  postForm(form).then(function (res) {
+    if (res.url && res.url.indexOf('error=') !== -1) { location.href = res.url; return; }
+    if (!res.ok) { form.submit(); return; }
+    if (card) card.remove();
+    var badge = document.querySelector('.topnav .badge');
+    if (badge) {
+      var left = parseInt(badge.textContent, 10) - n;
+      if (isNaN(left) || left <= 0) badge.remove();
+      else badge.textContent = String(left);
+    }
+    if (!document.querySelector('form[action="/inbox/label"]')) location.reload();
+  }).catch(function () { form.submit(); });
+});
+document.addEventListener('input', function (e) {
+  var el = e.target;
+  if (!el || el.name !== 'q') return;
+  var q = el.value.toLowerCase();
+  var table = document.querySelector('table');
+  if (!table) return;
+  var rows = table.querySelectorAll('tbody tr');
+  for (var i = 0; i < rows.length; i++) {
+    var text = (rows[i].textContent || '').toLowerCase();
+    rows[i].hidden = q.length > 0 && text.indexOf(q) === -1;
+  }
+});
+"#;
 
 /// Üst menüde hangi sekmenin aktif olduğunu damglamak için.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,15 +97,7 @@ pub(crate) fn tr_money(minor: i64) -> String {
     format!("{sign}{grouped},{:02} TL", minor % 100)
 }
 
-/// İşlem türünün tablodaki kısa Türkçe etiketi.
-pub(crate) fn kind_label(kind: TxnKind) -> &'static str {
-    match kind {
-        TxnKind::Pos => "pos",
-        TxnKind::Installment => "taksit",
-        TxnKind::Payment => "ödeme",
-        TxnKind::Refund => "iade",
-    }
-}
+
 
 /// Tek çubuk: etiket, kuruş değeri, gösterim metni, araç ipucu ve dolgu
 /// rengi. Yatay ve dikey çizim aynı yardımcıya gider.
@@ -156,6 +203,7 @@ fn nav_class(mine: Nav, active: Nav) -> Option<&'static str> {
 /// işlem sayılarının toplamı.
 pub(crate) async fn shell<'a>(
     cx: &'a Cx,
+    lang: Lang,
     title: &'a str,
     active: Nav,
     stage: Child<'a>,
@@ -166,10 +214,11 @@ pub(crate) async fn shell<'a>(
         .iter()
         .map(|g| g.count)
         .sum();
+    let en = lang == Lang::En;
     Ok(view! {
         cx =>
         <!DOCTYPE html>
-        <html lang="tr">
+        <html lang=(lang.code())>
             <head>
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -178,20 +227,25 @@ pub(crate) async fn shell<'a>(
             </head>
             <body>
                 <nav class="topnav">
-                    <a class=(nav_class(Nav::Home, active)) href="/">"Anasayfa"</a>
-                    <a class=(nav_class(Nav::Import, active)) href="/import">"İçe aktar"</a>
+                    <a class=(nav_class(Nav::Home, active)) href="/">(t(lang, Key::NavHome))</a>
+                    <a class=(nav_class(Nav::Import, active)) href="/import">(t(lang, Key::NavImport))</a>
                     <a class=(nav_class(Nav::Inbox, active)) href="/inbox">
-                        "Etiketle"
+                        (t(lang, Key::NavInbox))
                         if unlabeled > 0 {
                             <span class="badge">(unlabeled.to_string())</span>
                         }
                     </a>
-                    <a class=(nav_class(Nav::Txns, active)) href="/txns">"İşlemler"</a>
-                    <a class=(nav_class(Nav::Payees, active)) href="/payees">"Payeeler"</a>
+                    <a class=(nav_class(Nav::Txns, active)) href="/txns">(t(lang, Key::NavTxns))</a>
+                    <a class=(nav_class(Nav::Payees, active)) href="/payees">(t(lang, Key::NavPayees))</a>
+                    <span class="lang">
+                        <a class=(en.then_some("active")) href="/lang/en">"EN"</a>
+                        <a class=((!en).then_some("active")) href="/lang/tr">"TR"</a>
+                    </span>
                 </nav>
                 <main class="stage">
                     (stage)
                 </main>
+                <script>(Unescaped::new_unchecked(SHELL_JS))</script>
             </body>
         </html>
     })

@@ -5,6 +5,7 @@
 //! hatasında 2 ile çıkar. Tarayıcısız canlı duman testi tam olarak budur.
 
 mod config;
+mod i18n;
 mod layout;
 mod pages;
 mod server;
